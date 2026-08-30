@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+
+    <record id="payment.payment_method_tamara" model="payment.method">
+        <field name="support_manual_capture">full_only</field>
+        <field name="support_refund">partial</field>
+        <field
+            name="supported_country_ids"
+            eval="[
+                Command.set([
+                    ref('base.ae'),
+                    ref('base.bh'),
+                    ref('base.kw'),
+                    ref('base.om'),
+                    ref('base.sa'),
+            ])]"
+        />
+        <field
+            name="supported_currency_ids"
+            eval="[
+                Command.set([
+                    ref('base.AED'),
+                    ref('base.BHD'),
+                    ref('base.KWD'),
+                    ref('base.OMR'),
+                    ref('base.SAR'),
+            ])]"
+        />
+    </record>
+
+</odoo>

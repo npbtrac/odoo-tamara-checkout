@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="payment_provider_form" model="ir.ui.view">
+        <field name="name">Tamara Provider Form</field>
+        <field name="model">payment.provider</field>
+        <field name="inherit_id" ref="payment.payment_provider_form"/>
+        <field name="arch" type="xml">
+            <widget name="web_ribbon" position="after">
+                <widget name="web_ribbon" title="Sandbox Mode" bg_color="text-bg-warning"
+                        invisible="code != 'tamara' or module_state != 'installed' or tamara_state != 'sandbox'"/>
+            </widget>
+            <xpath expr="//sheet/widget[@name='web_ribbon'][2]" position="attributes">
+                <attribute name="invisible">code == 'tamara' or module_state != 'installed' or state != 'test'</attribute>
+            </xpath>
+            <field name="state" position="attributes">
+                <attribute name="invisible">code == 'tamara'</attribute>
+            </field>
+            <field name="state" position="after">
+                <field name="tamara_state" widget="radio" invisible="code != 'tamara'"/>
+                <field name="tamara_sandbox_mode" invisible="1"/>
+            </field>
+            <group name="provider_credentials" position="inside">
+                <group string="Sandbox" invisible="code != 'tamara'">
+                    <field name="tamara_sandbox_api_token" string="API Token (Merchant Token)"
+                           widget="text"
+                           required="code == 'tamara' and tamara_state == 'sandbox'"/>
+                    <field name="tamara_sandbox_notification_key" string="Notification Token"
+                           required="code == 'tamara' and tamara_state == 'sandbox'" password="True"/>
+                    <field name="tamara_sandbox_public_key" string="Public Key"
+                           required="code == 'tamara' and tamara_state == 'sandbox'"/>
+                    <field name="tamara_sandbox_webhook_id" string="Webhook ID"/>
+                    <field name="tamara_sandbox_webhook_url" string="Webhook URL" widget="CopyClipboardChar"/>
+                </group>
+                <group string="Live" invisible="code != 'tamara'">
+                    <field name="tamara_live_api_token" string="API Token (Merchant Token)"
+                           widget="text"
+                           required="code == 'tamara' and tamara_state == 'enabled'"/>
+                    <field name="tamara_live_notification_key" string="Notification Token"
+                           required="code == 'tamara' and tamara_state == 'enabled'" password="True"/>
+                    <field name="tamara_live_public_key" string="Public Key"
+                           required="code == 'tamara' and tamara_state == 'enabled'"/>
+                    <field name="tamara_live_webhook_id" string="Webhook ID"/>
+                    <field name="tamara_live_webhook_url" string="Webhook URL" widget="CopyClipboardChar"/>
+                </group>
+            </group>
+        </field>
+    </record>
+
+</odoo>

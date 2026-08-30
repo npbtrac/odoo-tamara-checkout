@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Image fields need a Python write to refresh attachments reliably. -->
+    <function model="payment.provider" name="_tamara_refresh_logos"/>
+</odoo>

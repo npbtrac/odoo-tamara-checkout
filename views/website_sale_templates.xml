@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Inject Tamara widget config + script into the website head when Tamara is enabled. -->
+    <template id="tamara_widget_head" inherit_id="website.layout" name="Tamara Widget Head">
+        <xpath expr="//head" position="inside">
+            <t t-set="tamara_provider"
+               t-value="request.env['payment.provider'].sudo().search([
+                   ('code', '=', 'tamara'),
+                   ('state', 'in', ['enabled', 'test']),
+                   ('is_published', '=', True),
+                   ('company_id', '=', request.env.company.id),
+               ], limit=1)"
+            />
+            <t t-if="tamara_provider and tamara_provider._tamara_get_public_key()">
+                <t t-set="tamara_widget" t-value="tamara_provider._tamara_get_widget_config()"/>
+                <script>
+                    window.tamaraWidgetConfig = {
+                        lang: "<t t-esc="tamara_widget['lang']"/>",
+                        country: "<t t-esc="tamara_widget['country']"/>",
+                        publicKey: "<t t-esc="tamara_widget['public_key']"/>"
+                    };
+                </script>
+                <script defer="defer" type="text/javascript"
+                        t-att-src="tamara_widget['widget_url']"/>
+            </t>
+        </xpath>
+    </template>
+
+    <!-- Product page promo widget below the price. -->
+    <template id="product_tamara_widget" inherit_id="website_sale.product_price"
+              name="Tamara Product Widget">
+        <xpath expr="//div[@name='product_price']" position="after">
+            <t t-set="tamara_provider"
+               t-value="request.env['payment.provider'].sudo().search([
+                   ('code', '=', 'tamara'),
+                   ('state', 'in', ['enabled', 'test']),
+                   ('is_published', '=', True),
+                   ('company_id', '=', request.env.company.id),
+               ], limit=1)"
+            />
+            <div t-if="tamara_provider and tamara_provider._tamara_get_public_key()"
+                 class="o_tamara_product_widget mt-2 mb-3"
+            >
+                <tamara-widget
+                    type="tamara-summary"
+                    t-att-amount="combination_info['price']"
+                    inline-type="2"
+                    config='{"theme":"light","badgePosition":"","showExtraContent":"","hidePayInX":false}'
+                />
+            </div>
+        </xpath>
+    </template>
+
+</odoo>

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <template id="redirect_form">
+        <!-- Tamara generates a unique checkout URL for each payment request. -->
+        <form t-att-action="api_url" method="get"/>
+    </template>
+
+    <template id="inline_form">
+        <t t-set="tamara_partner"
+           t-value="request.env['res.partner'].browse(partner_id).exists() if partner_id else request.env['res.partner']"
+        />
+        <t t-set="tamara_labels"
+           t-value="provider_sudo._tamara_get_payment_labels(
+               country_code=tamara_partner.country_id.code or None
+           )"
+        />
+        <t t-set="widget_amount" t-value="amount or 0"/>
+        <div class="o_tamara_checkout_inline mt-2"
+             t-att-data-provider-id="provider_sudo.id"
+        >
+            <tamara-widget
+                type="tamara-summary"
+                t-att-amount="widget_amount"
+                inline-type="6"
+                config='{"theme":"light","badgePosition":"","showExtraContent":"","hidePayInX":false}'
+            />
+        </div>
+    </template>
+
+</odoo>
