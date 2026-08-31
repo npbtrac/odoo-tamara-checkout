@@ -58,9 +58,13 @@ class TamaraController(http.Controller):
 
     @http.route(_eligibility_url, type='jsonrpc', auth='public', methods=['POST'])
     def tamara_pre_checkout_eligibility(
-        self, provider_id, amount, currency_id, partner_id=None, phone=None, email=None, **_kwargs
+        self, provider_id, amount, currency_id, partner_id=None, phone=None, email=None,
+        sale_order_id=None, **_kwargs
     ):
         """Check Tamara pre-checkout eligibility for the current checkout form values.
+
+        Uses the configured eligibility timeout so the payment form can hide Tamara when
+        the API returns `is_eligible: false`.
 
         :param int provider_id: The Tamara provider id.
         :param float amount: The order amount.
@@ -68,6 +72,7 @@ class TamaraController(http.Controller):
         :param int partner_id: Optional partner id.
         :param str phone: Optional phone number from the checkout form.
         :param str email: Optional email from the checkout form.
+        :param int sale_order_id: Optional website sale order id (uses invoice partner phone).
         :return: Whether Tamara should be shown.
         :rtype: dict
         """
@@ -76,6 +81,9 @@ class TamaraController(http.Controller):
             return {'is_eligible': False}
 
         partner = request.env['res.partner'].sudo().browse(partner_id).exists()
+        order = request.env['sale.order'].sudo().browse(sale_order_id).exists()
+        if order:
+            partner = order.partner_invoice_id or order.partner_id or partner
         currency = request.env['res.currency'].sudo().browse(currency_id).exists()
         is_eligible = provider_sudo._tamara_is_customer_eligible(
             amount=amount,
@@ -83,6 +91,7 @@ class TamaraController(http.Controller):
             partner=partner,
             phone=phone,
             email=email,
+            timeout=const.ELIGIBILITY_TIMEOUT,
         )
         return {'is_eligible': is_eligible}
 

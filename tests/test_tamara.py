@@ -52,9 +52,12 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(labels['title'], 'Tamara')
         self.assertEqual(labels['description'], 'Monthly Payments.')
 
-    def test_eligibility_defaults_true_without_phone(self):
-        self.assertTrue(self.provider._tamara_is_customer_eligible(
-            amount=100, currency=self.currency, phone='',
+    def test_eligibility_hides_without_phone_or_email(self):
+        self.assertFalse(self.provider._tamara_is_customer_eligible(
+            amount=100, currency=self.currency, phone='', email='buyer@example.com',
+        ))
+        self.assertFalse(self.provider._tamara_is_customer_eligible(
+            amount=100, currency=self.currency, phone='966501234567', email='',
         ))
 
     def test_eligibility_fail_open_on_timeout(self):
@@ -63,7 +66,10 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             side_effect=requests.exceptions.Timeout(),
         ):
             self.assertTrue(self.provider._tamara_is_customer_eligible(
-                amount=100, currency=self.currency, phone='966501234567',
+                amount=100,
+                currency=self.currency,
+                phone='966501234567',
+                email='buyer@example.com',
             ))
 
     def test_webhook_registration_saves_id(self):

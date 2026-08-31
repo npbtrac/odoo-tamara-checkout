@@ -227,6 +227,10 @@ class PaymentProvider(models.Model):
             is_validation=is_validation, report=report, **kwargs
         )
         partner = self.env['res.partner'].browse(partner_id)
+        # Prefer the invoice address from the website order when available.
+        sale_order = self.env['sale.order'].browse(kwargs.get('sale_order_id')).exists()
+        if sale_order:
+            partner = sale_order.partner_invoice_id or sale_order.partner_id or partner
         currency = self.env['res.currency'].browse(currency_id).exists()
         tamara_providers = providers.filtered(lambda p: p.code == 'tamara')
         if not tamara_providers:
@@ -253,6 +257,30 @@ class PaymentProvider(models.Model):
         return providers
 
     # === BUSINESS METHODS === #
+
+    @api.model
+    def _tamara_get_website_provider(self, website=None):
+        """Return the Tamara provider usable for website widgets/checkout.
+
+        Prefers the current website company. Widgets are shown for sandbox (`test`) and
+        live (`enabled`) providers that have a public key, without requiring `is_published`
+        (sandbox providers stay unpublished by default in core payment).
+
+        :param website website: Optional website; defaults to the current website.
+        :return: The matching provider, or an empty recordset.
+        :rtype: payment.provider
+        """
+        website = website or self.env['website'].get_current_website()
+        company = website.company_id if website else self.env.company
+        providers = self.sudo().search([
+            ('code', '=', 'tamara'),
+            ('state', 'in', ['enabled', 'test']),
+            ('company_id', '=', company.id),
+        ], order='is_published desc, id')
+        for provider in providers:
+            if provider._tamara_get_public_key():
+                return provider
+        return self.browse()
 
     def _tamara_is_sandbox(self):
         """Return whether Tamara sandbox APIs and credentials should be used.
@@ -465,26 +493,53 @@ class PaymentProvider(models.Model):
             })
         return webhook_id
 
-    def _tamara_is_customer_eligible(self, amount, currency, partner=None, phone=None, email=None):
+    def _tamara_normalize_phone(self, phone):
+        """Return digits-only phone for Tamara eligibility (e.g. 966501234567).
+
+        :param str phone: Raw phone value.
+        :return: Normalized phone, or empty string.
+        :rtype: str
+        """
+        if not phone:
+            return ''
+        return ''.join(ch for ch in str(phone) if ch.isdigit())
+
+    def _tamara_partner_phone(self, partner):
+        """Return the best phone number available on the partner.
+
+        :param res.partner partner: Customer partner.
+        :return: Normalized phone, or empty string.
+        :rtype: str
+        """
+        if not partner:
+            return ''
+        return self._tamara_normalize_phone(partner.phone or partner.mobile)
+
+    def _tamara_is_customer_eligible(
+        self, amount, currency, partner=None, phone=None, email=None, timeout=None,
+    ):
         """Return whether Tamara should be shown for the customer (pre-checkout eligibility).
 
-        Defaults to eligible when the phone is missing, or when the API times out / errors,
-        per Tamara's recommended behaviour.
+        Hides Tamara when phone or email is missing (no API call). When both are present,
+        calls Tamara's eligibility API. Timeouts / errors fail open (show Tamara):
+        https://docs.tamara.co/reference/pre-checkout-eligibility
 
         :param float amount: Order amount.
         :param res.currency currency: Order currency.
         :param res.partner partner: Customer partner, if any.
         :param str phone: Optional phone override.
         :param str email: Optional email override.
+        :param float timeout: Optional request timeout override (seconds).
         :return: Whether Tamara is eligible.
         :rtype: bool
         """
         self.ensure_one()
         partner = partner or self.env['res.partner']
-        phone = (phone or (partner.phone if partner else '') or '').replace(' ', '')
-        email = email or (partner.email if partner else '') or ''
-        if not phone:
-            return True
+        phone = self._tamara_normalize_phone(phone) or self._tamara_partner_phone(partner)
+        email = (email or (partner.email if partner else '') or '').strip()
+        # Require phone + email before showing Tamara; skip the API when either is missing.
+        if not phone or not email:
+            return False
         if not currency or currency.name not in const.SUPPORTED_CURRENCIES:
             return True
 
@@ -495,24 +550,41 @@ class PaymentProvider(models.Model):
             },
             'customer': {
                 'phone_number': phone,
-                'email': email or 'precheck-fallback@example.com',
+                'email': email,
             },
         }
         url = self._build_request_url('/pre-checkout/v1/eligibility')
         headers = self._build_request_headers('POST', '/pre-checkout/v1/eligibility', payload)
+        request_timeout = const.ELIGIBILITY_TIMEOUT if timeout is None else timeout
         try:
             response = requests.post(
-                url, json=payload, headers=headers, timeout=const.ELIGIBILITY_TIMEOUT,
+                url, json=payload, headers=headers, timeout=request_timeout,
             )
             if not response.ok:
+                _logger.info(
+                    "Tamara eligibility non-OK for provider %s phone=%s: %s",
+                    self.id, phone, response.status_code,
+                )
                 return True
             data = response.json()
-            return bool(data.get('is_eligible', True))
-        except (requests.exceptions.RequestException, ValueError):
+            is_eligible = bool(data.get('is_eligible', True))
+            _logger.info(
+                "Tamara eligibility for provider %s phone=%s -> %s",
+                self.id, phone, is_eligible,
+            )
+            return is_eligible
+        except (requests.exceptions.RequestException, ValueError) as error:
+            _logger.info(
+                "Tamara eligibility fallback (show) for provider %s phone=%s: %s",
+                self.id, phone, error,
+            )
             return True
 
     def _tamara_get_widget_config(self, country_code=None, lang=None):
         """Return values needed to render Tamara widgets on the website.
+
+        Country is resolved from (in order): explicit override, website/pricelist currency,
+        partner/company country, then SA.
 
         :param str country_code: Optional country override.
         :param str lang: Optional language override.
@@ -522,6 +594,15 @@ class PaymentProvider(models.Model):
         self.ensure_one()
         lang = lang or self.env.context.get('lang') or 'en_US'
         lang_code = 'ar' if lang.startswith('ar') else 'en'
+
+        if not country_code:
+            currency = None
+            website = self.env['website'].get_current_website()
+            if website:
+                currency = website.currency_id
+            currency_code = currency.name if currency else None
+            country_code = const.CURRENCY_COUNTRY_MAP.get(currency_code)
+
         return {
             'public_key': self._tamara_get_public_key() or '',
             'country': (country_code or self._tamara_get_country_code() or 'SA').upper(),

@@ -44,4 +44,11 @@
         </xpath>
     </template>
 
+    <!-- Expose the website order id so the Tamara eligibility RPC can use the invoice partner. -->
+    <template id="payment_form_tamara_sale_order" inherit_id="payment.form">
+        <xpath expr="//form[@id='o_payment_form']" position="attributes">
+            <attribute name="t-att-data-sale-order-id">sale_order_id</attribute>
+        </xpath>
+    </template>
+
 </odoo>

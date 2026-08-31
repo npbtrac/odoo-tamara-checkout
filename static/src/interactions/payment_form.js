@@ -13,6 +13,10 @@ patch(PaymentForm.prototype, {
     /**
      * Re-check Tamara pre-checkout eligibility and hide/show the payment option.
      *
+     * Calls Tamara eligibility with the configured timeout so the payment method
+     * visibility reflects the API when phone + email are present.
+     * See https://docs.tamara.co/reference/pre-checkout-eligibility
+     *
      * @private
      * @return {Promise<void>}
      */
@@ -27,6 +31,9 @@ patch(PaymentForm.prototype, {
         const amount = parseFloat(this.paymentContext['amount'] || 0);
         const currencyId = parseInt(this.paymentContext['currencyId'] || 0);
         const partnerId = parseInt(this.paymentContext['partnerId'] || 0);
+        const saleOrderId = parseInt(
+            this.paymentContext['saleOrderId'] || this.el.dataset.saleOrderId || 0
+        );
         if (!providerId || !currencyId) {
             return;
         }
@@ -38,6 +45,7 @@ patch(PaymentForm.prototype, {
                 amount: amount,
                 currency_id: currencyId,
                 partner_id: partnerId || null,
+                sale_order_id: saleOrderId || null,
             }));
             isEligible = Boolean(result && result.is_eligible);
         } catch {

@@ -21,6 +21,7 @@
     'assets': {
         'web.assets_frontend': [
             'payment_tamara/static/src/interactions/payment_form.js',
+            'payment_tamara/static/src/interactions/product_widget.js',
         ],
     },
     'post_init_hook': 'post_init_hook',

@@ -16,9 +16,11 @@ This module integrates Tamara using the generic payment with redirection flow pr
 - Manual capture
 - Full and partial refunds
 - Cancellation of authorised orders
-- Product page promo widget (`tamara-summary`, inline-type `2`)
+- Product page promo widget above Add to Cart (`tamara-summary`, inline-type `2`; amount updates on variant change)
+- Cart page promo widget above Checkout (`tamara-summary`, inline-type `5`)
 - Checkout payment labels (KSA Sharia copy vs other countries, EN/AR) + checkout widget (inline-type `6`)
-- Pre-checkout eligibility gating (`POST /pre-checkout/v1/eligibility`, 200ms timeout, fail-open)
+- Pre-checkout eligibility ([docs](https://docs.tamara.co/reference/pre-checkout-eligibility)): 2s timeout, fail-open on API errors; Tamara is hidden when billing phone or email is missing (no API call)
+- Pre-checkout eligibility gating (`POST /pre-checkout/v1/eligibility`, 2s timeout, fail-open)
 
 ## Not implemented features
 

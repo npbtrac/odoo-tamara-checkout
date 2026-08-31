@@ -5,14 +5,9 @@
     <template id="tamara_widget_head" inherit_id="website.layout" name="Tamara Widget Head">
         <xpath expr="//head" position="inside">
             <t t-set="tamara_provider"
-               t-value="request.env['payment.provider'].sudo().search([
-                   ('code', '=', 'tamara'),
-                   ('state', 'in', ['enabled', 'test']),
-                   ('is_published', '=', True),
-                   ('company_id', '=', request.env.company.id),
-               ], limit=1)"
+               t-value="request.env['payment.provider']._tamara_get_website_provider(request.website)"
             />
-            <t t-if="tamara_provider and tamara_provider._tamara_get_public_key()">
+            <t t-if="tamara_provider">
                 <t t-set="tamara_widget" t-value="tamara_provider._tamara_get_widget_config()"/>
                 <script>
                     window.tamaraWidgetConfig = {
@@ -27,25 +22,40 @@
         </xpath>
     </template>
 
-    <!-- Product page promo widget below the price. -->
-    <template id="product_tamara_widget" inherit_id="website_sale.product_price"
+    <!-- Product page promo widget above the add-to-cart CTA. -->
+    <template id="product_tamara_widget" inherit_id="website_sale.product"
               name="Tamara Product Widget">
-        <xpath expr="//div[@name='product_price']" position="after">
+        <xpath expr="//div[hasclass('o_wsale_product_details_content_section_cta')]" position="before">
             <t t-set="tamara_provider"
-               t-value="request.env['payment.provider'].sudo().search([
-                   ('code', '=', 'tamara'),
-                   ('state', 'in', ['enabled', 'test']),
-                   ('is_published', '=', True),
-                   ('company_id', '=', request.env.company.id),
-               ], limit=1)"
+               t-value="request.env['payment.provider']._tamara_get_website_provider(request.website)"
             />
-            <div t-if="tamara_provider and tamara_provider._tamara_get_public_key()"
-                 class="o_tamara_product_widget mt-2 mb-3"
+            <div t-if="tamara_provider"
+                 class="o_tamara_product_widget o_wsale_product_details_content_section mb-3"
             >
                 <tamara-widget
                     type="tamara-summary"
-                    t-att-amount="combination_info['price']"
+                    t-att-amount="combination_info.get('price') or 0"
                     inline-type="2"
+                    config='{"theme":"light","badgePosition":"","showExtraContent":"","hidePayInX":false}'
+                />
+            </div>
+        </xpath>
+    </template>
+
+    <!-- Cart page promo widget above the Checkout button. -->
+    <template id="cart_tamara_widget" inherit_id="website_sale.shorter_cart_summary"
+              name="Tamara Cart Widget">
+        <xpath expr="//t[@t-call='website_sale.navigation_buttons']" position="before">
+            <t t-set="tamara_provider"
+               t-value="request.env['payment.provider']._tamara_get_website_provider(request.website)"
+            />
+            <div t-if="tamara_provider and website_sale_order"
+                 class="o_tamara_cart_widget mb-3"
+            >
+                <tamara-widget
+                    type="tamara-summary"
+                    t-att-amount="website_sale_order.amount_total"
+                    inline-type="5"
                     config='{"theme":"light","badgePosition":"","showExtraContent":"","hidePayInX":false}'
                 />
             </div>

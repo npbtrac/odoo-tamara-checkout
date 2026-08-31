@@ -15,6 +15,15 @@ WIDGET_URLS = {
     'test': 'https://cdn-sandbox.tamara.co/widget-v2/tamara-widget.js',
 }
 
+# ISO 4217 currency → ISO 3166-1 alpha-2 country for Tamara widgets.
+CURRENCY_COUNTRY_MAP = {
+    'SAR': 'SA',
+    'AED': 'AE',
+    'BHD': 'BH',
+    'KWD': 'KW',
+    'OMR': 'OM',
+}
+
 # ISO 3166-1 alpha-2 country codes supported by Tamara checkout.
 SUPPORTED_COUNTRIES = {
     'SA',
@@ -54,8 +63,8 @@ WEBHOOK_EVENTS = [
 # Error code returned when the webhook URL is already registered.
 WEBHOOK_ALREADY_REGISTERED = 'webhook_already_registered'
 
-# Pre-checkout eligibility timeout (seconds). Docs recommend 200ms.
-ELIGIBILITY_TIMEOUT = 0.2
+# Pre-checkout eligibility timeout (seconds).
+ELIGIBILITY_TIMEOUT = 2.0
 
 # Payment method codes to activate when Tamara is enabled.
 DEFAULT_PAYMENT_METHOD_CODES = {
