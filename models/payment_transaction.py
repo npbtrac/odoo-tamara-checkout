@@ -28,6 +28,18 @@ class PaymentTransaction(models.Model):
         readonly=True,
         copy=False,
     )
+    tamara_order_status = fields.Char(
+        string="Tamara Order Status",
+        help="The latest order status returned by the Tamara order details API.",
+        readonly=True,
+        copy=False,
+    )
+    tamara_payment_type = fields.Char(
+        string="Tamara Payment Type",
+        help="The payment type returned by the Tamara order details API.",
+        readonly=True,
+        copy=False,
+    )
 
     def _get_specific_rendering_values(self, processing_values):
         """Override of `payment` to return Tamara-specific rendering values.
@@ -182,6 +194,37 @@ class PaymentTransaction(models.Model):
             raise ValidationError(_("The Tamara order id is missing."))
         return self._send_api_request('GET', f'/orders/{order_id}')
 
+    def _tamara_can_process_return(self):
+        """Return whether this transaction can query Tamara after checkout.
+
+        The transaction must use both the Tamara provider and payment method, and the
+        provider must remain enabled and published.
+
+        :return: Whether the Tamara return can be processed.
+        :rtype: bool
+        """
+        self.ensure_one()
+        return bool(
+            self.provider_code == 'tamara'
+            and self.payment_method_id.code == 'tamara'
+            and self.provider_id.state in ('enabled', 'test')
+            and self.provider_id.is_published
+        )
+
+    def _tamara_update_order_metadata(self, order_data):
+        """Store metadata returned by Tamara's order details API.
+
+        :param dict order_data: The latest Tamara order details.
+        :return: None
+        """
+        self.ensure_one()
+        order_id = order_data.get('order_id') or self.tamara_order_id or self.provider_reference
+        self.write({
+            'tamara_order_id': order_id,
+            'tamara_order_status': order_data.get('status') or False,
+            'tamara_payment_type': order_data.get('payment_type') or False,
+        })
+
     def _tamara_process_return(self, order_data):
         """Apply Tamara's latest order status after the customer returns from checkout.
 
@@ -192,6 +235,7 @@ class PaymentTransaction(models.Model):
         :return: None
         """
         self.ensure_one()
+        self._tamara_update_order_metadata(order_data)
         status = (order_data.get('status') or '').lower()
         successful_statuses = {
             'authorised',

@@ -8,6 +8,8 @@
         <field name="arch" type="xml">
             <field name="provider_reference" position="after">
                 <field name="tamara_order_id" invisible="provider_code != 'tamara'"/>
+                <field name="tamara_order_status" invisible="provider_code != 'tamara'"/>
+                <field name="tamara_payment_type" invisible="provider_code != 'tamara'"/>
                 <field name="tamara_checkout_url" widget="url"
                        invisible="provider_code != 'tamara'"/>
             </field>

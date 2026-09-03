@@ -84,6 +84,9 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             provider_reference=self.order_data['order_id'],
             tamara_order_id=self.order_data['order_id'],
         )
+        self.provider.with_context(tamara_skip_webhook_register=True).write({
+            'is_published': True,
+        })
         url = self._build_url(f'{TamaraController._return_url}?ref={tx.reference}')
         with patch(
             'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
@@ -93,6 +96,9 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
 
         tx.invalidate_recordset()
         self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.tamara_order_id, self.order_data['order_id'])
+        self.assertEqual(tx.tamara_order_status, 'authorised')
+        self.assertEqual(tx.tamara_payment_type, 'PAY_BY_INSTALMENTS')
         send_request.assert_called_once_with(
             'GET',
             f"/orders/{self.order_data['order_id']}",
@@ -101,6 +107,37 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             json=None,
             reference=tx.reference,
         )
+
+    def test_return_does_not_fetch_order_when_provider_is_unpublished(self):
+        tx = self._create_transaction(
+            flow='redirect',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        self.provider.with_context(tamara_skip_webhook_register=True).write({
+            'is_published': False,
+        })
+        url = self._build_url(f'{TamaraController._return_url}?ref={tx.reference}')
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+        ) as send_request:
+            self.url_open(url)
+
+        send_request.assert_not_called()
+        tx.invalidate_recordset()
+        self.assertFalse(tx.tamara_order_status)
+        self.assertFalse(tx.tamara_payment_type)
+
+    def test_return_metadata_uses_provider_reference_as_order_id_fallback(self):
+        tx = self._create_transaction(
+            flow='redirect',
+            provider_reference=self.order_data['order_id'],
+        )
+        tx._tamara_process_return(self.order_data)
+
+        self.assertEqual(tx.tamara_order_id, self.order_data['order_id'])
+        self.assertEqual(tx.tamara_order_status, 'authorised')
+        self.assertEqual(tx.tamara_payment_type, 'PAY_BY_INSTALMENTS')
 
     def test_return_status_authorised_is_successful(self):
         tx = self._create_transaction(flow='redirect')

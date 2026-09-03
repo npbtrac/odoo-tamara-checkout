@@ -37,6 +37,13 @@ class TamaraController(http.Controller):
         tx_sudo = request.env['payment.transaction'].sudo()._search_by_reference('tamara', data)
         if not tx_sudo:
             return request.redirect('/payment/status')
+        if not tx_sudo._tamara_can_process_return():
+            _logger.warning(
+                "Ignoring Tamara return for transaction %s: the Tamara payment method "
+                "or published provider is unavailable.",
+                tx_sudo.reference,
+            )
+            return request.redirect('/payment/status')
 
         try:
             order_data = tx_sudo._tamara_fetch_order()

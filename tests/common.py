@@ -26,6 +26,12 @@ class TamaraCommon(PaymentCommon):
                 'tamara_live_public_key': 'dummy_live_public_key',
             })
         cls.provider = cls.tamara
+        cls.payment_methods = cls.provider.payment_method_ids.filtered(
+            lambda method: method.code == 'tamara'
+        )
+        cls.payment_method = cls.payment_methods[:1]
+        cls.payment_method_id = cls.payment_method.id
+        cls.payment_method_code = cls.payment_method.code
         cls.currency = cls._enable_currency('SAR')
 
         cls.payment_data = {
@@ -47,6 +53,7 @@ class TamaraCommon(PaymentCommon):
             'order_id': '11111111-1111-1111-1111-111111111111',
             'order_reference_id': cls.reference,
             'status': 'authorised',
+            'payment_type': 'PAY_BY_INSTALMENTS',
             'total_amount': {'amount': cls.amount, 'currency': 'SAR'},
         }
 
