@@ -34,7 +34,22 @@ class TamaraController(http.Controller):
         :param dict data: The query parameters sent by Tamara, including the transaction `ref`.
         """
         _logger.info("handling redirection from Tamara with data:\n%s", pprint.pformat(data))
-        self._verify_and_process(data, verify_notification_token=False)
+        tx_sudo = request.env['payment.transaction'].sudo()._search_by_reference('tamara', data)
+        if not tx_sudo:
+            return request.redirect('/payment/status')
+
+        try:
+            order_data = tx_sudo._tamara_fetch_order()
+        except ValidationError as error:
+            _logger.error(
+                "Unable to retrieve the Tamara order for transaction %s: %s",
+                tx_sudo.reference, error,
+            )
+            tx_sudo._set_error(
+                "Unable to retrieve the Tamara order details. Please contact support."
+            )
+        else:
+            tx_sudo._tamara_process_return(order_data)
         return request.redirect('/payment/status')
 
     @http.route(_webhook_url, type='http', auth='public', methods=['POST'], csrf=False)

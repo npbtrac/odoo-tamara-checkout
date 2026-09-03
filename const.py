@@ -19,27 +19,18 @@ WIDGET_URLS = {
 CURRENCY_COUNTRY_MAP = {
     'SAR': 'SA',
     'AED': 'AE',
-    'BHD': 'BH',
-    'KWD': 'KW',
-    'OMR': 'OM',
 }
 
 # ISO 3166-1 alpha-2 country codes supported by Tamara checkout.
 SUPPORTED_COUNTRIES = {
     'SA',
     'AE',
-    'BH',
-    'KW',
-    'OM',
 }
 
 # ISO 4217 currency codes supported by Tamara checkout.
 SUPPORTED_CURRENCIES = {
     'SAR',
     'AED',
-    'BHD',
-    'KWD',
-    'OMR',
 }
 
 # Tamara checkout locales (RFC 1766).
@@ -48,13 +39,14 @@ SUPPORTED_LOCALES = {
     'en_US',
 }
 
-# Order webhook events registered with Tamara (docs enum + examples).
+# Order webhook events registered with Tamara. This matches the request example in
+# https://docs.tamara.co/reference/registerwebhookurl; the `order_updated` event listed in
+# the schema enum is rejected by the API ("Invalid registered event order_updated").
 WEBHOOK_EVENTS = [
     'order_approved',
     'order_declined',
     'order_authorised',
     'order_canceled',
-    'order_updated',
     'order_captured',
     'order_refunded',
     'order_expired',

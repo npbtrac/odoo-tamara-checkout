@@ -5,9 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
+from odoo.exceptions import ValidationError
 from odoo.tests import tagged
 from odoo.tools import mute_logger
 
+from odoo.addons.payment_tamara import const
 from odoo.addons.payment.tests.http_common import PaymentHttpCommon
 from odoo.addons.payment_tamara.controllers.main import TamaraController
 from odoo.addons.payment_tamara.tests.common import TamaraCommon
@@ -35,7 +37,94 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(payload['payment_type'], 'PAY_BY_INSTALMENTS')
         self.assertEqual(payload['instalments'], 3)
         self.assertIn('success', payload['merchant_url'])
+        self.assertEqual(payload['merchant_url']['notification'], '')
         self.assertTrue(payload['items'])
+
+    def test_checkout_response_metadata_is_stored(self):
+        tx = self._create_transaction(flow='redirect')
+        checkout_data = {
+            'order_id': self.order_data['order_id'],
+            'checkout_url': 'https://checkout.tamara.co/example',
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=checkout_data,
+        ):
+            rendering_values = tx._get_specific_rendering_values({})
+
+        self.assertEqual(rendering_values['api_url'], checkout_data['checkout_url'])
+        self.assertEqual(tx.provider_reference, checkout_data['order_id'])
+        self.assertEqual(tx.tamara_order_id, checkout_data['order_id'])
+        self.assertEqual(tx.tamara_checkout_url, checkout_data['checkout_url'])
+
+    def test_fetch_order_uses_stored_tamara_order_id(self):
+        tx = self._create_transaction(
+            flow='redirect',
+            provider_reference='legacy-provider-reference',
+            tamara_order_id=self.order_data['order_id'],
+        )
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=self.order_data,
+        ) as send_request:
+            self.assertEqual(tx._tamara_fetch_order(), self.order_data)
+
+        send_request.assert_called_once_with(
+            'GET',
+            f"/orders/{self.order_data['order_id']}",
+            params=None,
+            data=None,
+            json=None,
+            reference=tx.reference,
+        )
+
+    def test_return_fetches_stored_order_and_marks_success(self):
+        tx = self._create_transaction(
+            flow='redirect',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        url = self._build_url(f'{TamaraController._return_url}?ref={tx.reference}')
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=self.order_data,
+        ) as send_request:
+            self.url_open(url)
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        send_request.assert_called_once_with(
+            'GET',
+            f"/orders/{self.order_data['order_id']}",
+            params=None,
+            data=None,
+            json=None,
+            reference=tx.reference,
+        )
+
+    def test_return_status_authorised_is_successful(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'authorised'})
+        self.assertEqual(tx.state, 'done')
+        self.assertIn('Payment successful', tx.state_message)
+
+    def test_return_status_captured_is_successful(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'fully_captured'})
+        self.assertEqual(tx.state, 'done')
+        self.assertIn('Payment successful', tx.state_message)
+
+    def test_return_status_declined_is_failure(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'declined'})
+        self.assertEqual(tx.state, 'error')
+        self.assertIn('Payment failed', tx.state_message)
+
+    def test_return_other_status_is_canceled(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'approved'})
+        self.assertEqual(tx.state, 'cancel')
+        self.assertIn('Payment canceled', tx.state_message)
 
     def test_payment_labels_ksa_english(self):
         labels = self.provider._tamara_get_payment_labels(country_code='SA', lang='en_US')
@@ -75,6 +164,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
     def test_webhook_registration_saves_id(self):
         mock_response = MagicMock()
         mock_response.ok = True
+        mock_response.status_code = 200
         mock_response.text = ''
         mock_response.json.return_value = {
             'webhook_id': 'wh-123',
@@ -95,6 +185,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
     def test_webhook_already_registered_still_saves_id(self):
         mock_response = MagicMock()
         mock_response.ok = False
+        mock_response.status_code = 400
         mock_response.text = ''
         mock_response.json.return_value = {
             'errors': [{
@@ -116,6 +207,96 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             self.provider.tamara_sandbox_webhook_url,
             'https://shop.example/payment/tamara/webhook',
         )
+
+    @mute_logger('odoo.addons.payment_tamara.models.payment_provider')
+    def test_webhook_4xx_raises_wrong_api_token(self):
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 401
+        mock_response.text = 'Unauthorized'
+        mock_response.json.return_value = {'message': 'Unauthorized'}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ):
+            with self.assertRaises(ValidationError) as error:
+                self.provider._tamara_register_webhook()
+        self.assertIn('Wrong API Token', str(error.exception))
+
+    @mute_logger('odoo.addons.payment_tamara.models.payment_provider')
+    def test_webhook_4xx_blocks_settings_save(self):
+        original_token = self.provider.tamara_sandbox_api_token
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 401
+        mock_response.text = 'Unauthorized'
+        mock_response.json.return_value = {'message': 'Unauthorized'}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ):
+            with self.assertRaises(ValidationError) as error:
+                self.provider.write({'tamara_sandbox_api_token': 'bad-token'})
+        self.assertIn('Wrong API Token', str(error.exception))
+        self.provider.invalidate_recordset()
+        self.assertEqual(self.provider.tamara_sandbox_api_token, original_token)
+
+    def test_settings_save_registers_webhook_once(self):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.text = ''
+        mock_response.json.return_value = {
+            'webhook_id': 'wh-saved',
+            'url': 'https://shop.example/payment/tamara/webhook',
+        }
+        # `tamara_state` is a computed field with an inverse, so saving it triggers nested
+        # writes; the webhook must still be registered exactly once per save.
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ) as mock_post:
+            self.provider.write({'tamara_state': 'sandbox'})
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(self.provider.tamara_sandbox_webhook_id, 'wh-saved')
+
+    def test_settings_save_registers_webhook_without_credential_change(self):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.text = ''
+        mock_response.json.return_value = {
+            'webhook_id': 'wh-plain-save',
+            'url': 'https://shop.example/payment/tamara/webhook',
+        }
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ) as mock_post:
+            self.provider.write({'maximum_amount': 1000.0})
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertEqual(self.provider.tamara_sandbox_webhook_id, 'wh-plain-save')
+
+    @mute_logger('odoo.addons.payment_tamara.models.payment_provider')
+    def test_settings_save_blocks_any_4xx(self):
+        """Any 4xx aborts the save and reports the Tamara error detail."""
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 400
+        mock_response.text = ''
+        mock_response.json.return_value = {'message': 'Invalid registered event'}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ):
+            with self.assertRaises(ValidationError) as error:
+                self.provider.write({'maximum_amount': 1000.0})
+        self.assertIn('Wrong API Token', str(error.exception))
+        self.assertIn('Invalid registered event', str(error.exception))
+
+    def test_webhook_events_exclude_order_updated(self):
+        """Tamara rejects `order_updated`: "Invalid registered event order_updated"."""
+        self.assertNotIn('order_updated', const.WEBHOOK_EVENTS)
 
     @mute_logger(
         'odoo.addons.payment_tamara.controllers.main',
@@ -161,6 +342,22 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             self.provider._tamara_get_notification_key(), 'dummy_sandbox_notification_key'
         )
         self.assertIn('api-sandbox.tamara.co', self.provider._build_request_url('checkout'))
+
+    def test_website_provider_requires_published(self):
+        website = self.env['website'].search([], limit=1)
+        self.provider.company_id = website.company_id
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.PaymentProvider'
+            '._tamara_register_webhook_on_save',
+            return_value=None,
+        ):
+            self.provider.is_published = True
+            self.assertEqual(
+                self.env['payment.provider']._tamara_get_website_provider(website),
+                self.provider,
+            )
+            self.provider.is_published = False
+        self.assertFalse(self.env['payment.provider']._tamara_get_website_provider(website))
 
     def test_live_credentials_are_used_in_live_mode(self):
         with patch(

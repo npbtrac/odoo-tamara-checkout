@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from odoo import _, api, models
+from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
 from odoo.tools import urls
 
@@ -15,6 +15,19 @@ _logger = get_payment_logger(__name__, const.SENSITIVE_KEYS)
 
 class PaymentTransaction(models.Model):
     _inherit = 'payment.transaction'
+
+    tamara_order_id = fields.Char(
+        string="Tamara Order ID",
+        help="The order ID returned by Tamara when the checkout session is created.",
+        readonly=True,
+        copy=False,
+    )
+    tamara_checkout_url = fields.Char(
+        string="Tamara Checkout URL",
+        help="The checkout URL returned by Tamara for this transaction.",
+        readonly=True,
+        copy=False,
+    )
 
     def _get_specific_rendering_values(self, processing_values):
         """Override of `payment` to return Tamara-specific rendering values.
@@ -35,13 +48,21 @@ class PaymentTransaction(models.Model):
             self._set_error(str(error))
             return {}
 
-        # Store Tamara's order id so return/webhook handling can fetch the live order status.
-        self.provider_reference = checkout_data.get('order_id')
-
+        order_id = checkout_data.get('order_id')
         checkout_url = checkout_data.get('checkout_url')
+        if not order_id:
+            self._set_error(_("Tamara did not return an order ID."))
+            return {}
         if not checkout_url:
             self._set_error(_("Tamara did not return a checkout URL."))
             return {}
+        # Keep provider_reference populated for Odoo's generic transaction UI and store explicit
+        # Tamara metadata so the return route can retrieve the order without trusting query data.
+        self.write({
+            'provider_reference': order_id,
+            'tamara_order_id': order_id,
+            'tamara_checkout_url': checkout_url,
+        })
         return {'api_url': checkout_url}
 
     def _tamara_prepare_checkout_payload(self):
@@ -53,7 +74,6 @@ class PaymentTransaction(models.Model):
         self.ensure_one()
         base_url = self.provider_id.get_base_url()
         return_url = urls.urljoin(base_url, f'{TamaraController._return_url}?ref={self.reference}')
-        webhook_url = urls.urljoin(base_url, TamaraController._webhook_url)
         first_name, last_name = payment_utils.split_partner_name(self.partner_name)
         phone = (self.partner_phone or '').replace(' ', '')
         country_code = self.partner_country_id.code or self.company_id.country_id.code or 'SA'
@@ -94,7 +114,7 @@ class PaymentTransaction(models.Model):
                 'success': return_url,
                 'failure': return_url,
                 'cancel': return_url,
-                'notification': webhook_url,
+                'notification': '',
             },
         }
         if self.partner_zip:
@@ -157,9 +177,39 @@ class PaymentTransaction(models.Model):
         :rtype: dict
         """
         self.ensure_one()
-        if not self.provider_reference:
+        order_id = self.tamara_order_id or self.provider_reference
+        if not order_id:
             raise ValidationError(_("The Tamara order id is missing."))
-        return self._send_api_request('GET', f'/merchants/orders/{self.provider_reference}')
+        return self._send_api_request('GET', f'/orders/{order_id}')
+
+    def _tamara_process_return(self, order_data):
+        """Apply Tamara's latest order status after the customer returns from checkout.
+
+        The return URL is only a signal. The caller must pass order details fetched directly from
+        Tamara using the order ID stored when the checkout session was created.
+
+        :param dict order_data: The latest Tamara order details.
+        :return: None
+        """
+        self.ensure_one()
+        status = (order_data.get('status') or '').lower()
+        successful_statuses = {
+            'authorised',
+            'authorized',
+            'captured',
+            'fully_captured',
+            'partially_captured',
+        }
+        if status in successful_statuses:
+            self._set_done(
+                state_message=_("Payment successful. Tamara order status: %s.", status)
+            )
+        elif status == 'declined':
+            self._set_error(_("Payment failed. Tamara declined the order."))
+        else:
+            self._set_canceled(
+                _("Payment canceled. Tamara order status: %s.", status or _("unknown"))
+            )
 
     def _tamara_authorise_if_needed(self, order_data):
         """Authorise the Tamara order when it is in the `approved` state.

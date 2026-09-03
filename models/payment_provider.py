@@ -156,24 +156,47 @@ class PaymentProvider(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        providers = super().create(vals_list)
-        providers.filtered(lambda p: p.code == 'tamara')._tamara_register_webhook_on_save()
-        return providers
+        if self._tamara_skip_webhook_register() or not any(
+            vals.get('code') == 'tamara' for vals in vals_list
+        ):
+            return super().create(vals_list)
+        # Roll back the new records if webhook registration rejects the API token.
+        with self.env.cr.savepoint():
+            providers = super(
+                PaymentProvider, self.with_context(tamara_skip_webhook_register=True)
+            ).create(vals_list)
+            providers.filtered(
+                lambda p: p.code == 'tamara'
+            ).with_env(self.env)._tamara_register_webhook_on_save()
+            return providers.with_env(self.env)
 
     def write(self, vals):
-        if self.env.context.get('tamara_skip_webhook_register'):
+        tamara_providers = self.filtered(lambda p: p.code == 'tamara')
+        if not tamara_providers or self._tamara_skip_webhook_register():
             return super().write(vals)
-        result = super().write(vals)
-        webhook_triggers = {
-            'state', 'tamara_state', 'tamara_sandbox_mode',
-            'tamara_sandbox_api_token', 'tamara_sandbox_notification_key',
-            'tamara_sandbox_public_key',
-            'tamara_live_api_token', 'tamara_live_notification_key',
-            'tamara_live_public_key',
-        }
-        if webhook_triggers & set(vals):
-            self.filtered(lambda p: p.code == 'tamara')._tamara_register_webhook_on_save()
-        return result
+        # Register once per save: nested writes (field inverses, webhook fields) are skipped.
+        # The savepoint rolls the save back when Tamara rejects the API token.
+        with self.env.cr.savepoint():
+            result = super(
+                PaymentProvider, self.with_context(tamara_skip_webhook_register=True)
+            ).write(vals)
+            tamara_providers._tamara_register_webhook_on_save()
+            return result
+
+    def _tamara_skip_webhook_register(self):
+        """Return whether webhook registration must be skipped for the current write.
+
+        Registration is skipped for nested writes and while module data is being loaded,
+        so installing or upgrading the module never calls the Tamara API.
+
+        :return: Whether to skip webhook registration.
+        :rtype: bool
+        """
+        return bool(
+            self.env.context.get('tamara_skip_webhook_register')
+            or self.env.context.get('install_mode')
+            or self.env.context.get('module')
+        )
 
     def _get_default_payment_method_codes(self):
         """Override of `payment` to return the default payment method codes."""
@@ -262,9 +285,10 @@ class PaymentProvider(models.Model):
     def _tamara_get_website_provider(self, website=None):
         """Return the Tamara provider usable for website widgets/checkout.
 
-        Prefers the current website company. Widgets are shown for sandbox (`test`) and
-        live (`enabled`) providers that have a public key, without requiring `is_published`
-        (sandbox providers stay unpublished by default in core payment).
+        Prefers the current website company. Widgets are only shown for published sandbox
+        (`test`) or live (`enabled`) providers that have a public key. Sandbox providers stay
+        unpublished by default in core payment, so Tamara must be published to appear on the
+        product and cart pages.
 
         :param website website: Optional website; defaults to the current website.
         :return: The matching provider, or an empty recordset.
@@ -275,8 +299,9 @@ class PaymentProvider(models.Model):
         providers = self.sudo().search([
             ('code', '=', 'tamara'),
             ('state', 'in', ['enabled', 'test']),
+            ('is_published', '=', True),
             ('company_id', '=', company.id),
-        ], order='is_published desc, id')
+        ], order='id')
         for provider in providers:
             if provider._tamara_get_public_key():
                 return provider
@@ -423,24 +448,26 @@ class PaymentProvider(models.Model):
         return urls.urljoin(self.get_base_url(), TamaraController._webhook_url)
 
     def _tamara_register_webhook_on_save(self):
-        """Register the Tamara webhook for enabled providers after settings are saved."""
+        """Register the Tamara webhook for enabled providers after settings are saved.
+
+        Providers without an API token are skipped. A 4xx response from Tamara is treated
+        as an invalid API token and raised as `ValidationError` so the settings save is
+        aborted.
+        """
         for provider in self.filtered(lambda p: p.state != 'disabled' and p._tamara_get_api_token()):
-            try:
-                provider._tamara_register_webhook()
-            except Exception:  # noqa: BLE001 - never block settings save on webhook errors.
-                _logger.exception(
-                    "Failed to register Tamara webhook for provider %s.", provider.id
-                )
+            provider._tamara_register_webhook()
 
     def _tamara_register_webhook(self):
         """Register the order webhook with Tamara and store the webhook id + URL.
 
+        Calls `POST /webhooks` (https://docs.tamara.co/reference/registerwebhookurl).
         A response of `webhook_already_registered` is treated as success and the existing
-        webhook id from the error payload is saved. The registered webhook URL is always
-        persisted so admins can see what endpoint Tamara was pointed at.
+        webhook id from the error payload is saved. Any other 4xx response means the API
+        token is invalid: a `ValidationError` is raised and the settings save is stopped.
 
         :return: The webhook id, if any.
         :rtype: str|None
+        :raise ValidationError: If Tamara returns a 4xx status (invalid API token).
         """
         self.ensure_one()
         webhook_url = self._tamara_get_webhook_url()
@@ -451,6 +478,10 @@ class PaymentProvider(models.Model):
         }
         url = self._build_request_url('/webhooks')
         headers = self._build_request_headers('POST', '/webhooks', payload)
+        _logger.info(
+            "Registering Tamara webhook for provider %s: POST %s (url=%s)",
+            self.id, url, webhook_url,
+        )
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=10)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -467,6 +498,10 @@ class PaymentProvider(models.Model):
             webhook_id = data.get('webhook_id')
             # Prefer the URL Tamara acknowledged when present.
             webhook_url = data.get('url') or webhook_url
+            _logger.info(
+                "Tamara webhook registered for provider %s (id=%s, url=%s).",
+                self.id, webhook_id, webhook_url,
+            )
         else:
             errors = data.get('errors') or []
             first_error = errors[0] if errors else {}
@@ -478,6 +513,16 @@ class PaymentProvider(models.Model):
                     "Tamara webhook already registered for provider %s (id=%s).",
                     self.id, webhook_id,
                 )
+            elif 400 <= (response.status_code or 0) < 500:
+                _logger.warning(
+                    "Tamara webhook registration rejected for provider %s (HTTP %s): %s",
+                    self.id, response.status_code, data or response.text,
+                )
+                details = self._parse_response_error(response)
+                message = _("Wrong API Token.")
+                if details:
+                    message = f'{message}\n\n{details}'
+                raise ValidationError(message)
             else:
                 _logger.warning(
                     "Tamara webhook registration failed for provider %s: %s",

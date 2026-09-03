@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+import requests
+
 from odoo.addons.payment.tests.common import PaymentCommon
 
 
@@ -32,9 +34,28 @@ class TamaraCommon(PaymentCommon):
             'order_id': '11111111-1111-1111-1111-111111111111',
             'event_type': 'order_authorised',
         }
+        cls._patch_webhook_url('http://localhost:8069/payment/tamara/webhook')
+        # Never reach the real Tamara API from tests: saving a provider registers the
+        # webhook, and an unreachable API is handled without blocking the save. Tests that
+        # exercise registration patch `requests.post` themselves.
+        cls.startClassPatcher(patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            side_effect=requests.exceptions.ConnectionError(),
+        ))
+
         cls.order_data = {
             'order_id': '11111111-1111-1111-1111-111111111111',
             'order_reference_id': cls.reference,
             'status': 'authorised',
             'total_amount': {'amount': cls.amount, 'currency': 'SAR'},
         }
+
+    _WEBHOOK_URL_PATH = (
+        'odoo.addons.payment_tamara.models.payment_provider.PaymentProvider'
+        '._tamara_get_webhook_url'
+    )
+
+    @classmethod
+    def _patch_webhook_url(cls, url):
+        """Force the webhook URL Tamara would be pointed at, for the whole test class."""
+        cls.startClassPatcher(patch(cls._WEBHOOK_URL_PATH, return_value=url))

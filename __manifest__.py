@@ -9,13 +9,16 @@
     'website': 'https://tamara.co',
     'depends': ['payment', 'website_sale'],
     'data': [
+        # The provider record references the form templates, and the menus
+        # reference the provider record, so keep this load order.
         'views/payment_tamara_templates.xml',
         'views/payment_form_templates.xml',
         'views/payment_provider_views.xml',
+        'views/payment_transaction_views.xml',
         'views/website_sale_templates.xml',
-        'views/payment_tamara_menus.xml',
         'data/payment_method_data.xml',
         'data/payment_provider_data.xml',
+        'views/payment_tamara_menus.xml',
         'data/payment_provider_logo_data.xml',
     ],
     'assets': {

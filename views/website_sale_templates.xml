@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
-    <!-- Inject Tamara widget config + script into the website head when Tamara is enabled. -->
+    <!-- Inject Tamara widget config + script into the website head when Tamara is published. -->
     <template id="tamara_widget_head" inherit_id="website.layout" name="Tamara Widget Head">
         <xpath expr="//head" position="inside">
             <t t-set="tamara_provider"
@@ -22,7 +22,7 @@
         </xpath>
     </template>
 
-    <!-- Product page promo widget above the add-to-cart CTA. -->
+    <!-- Product page promo widget above the add-to-cart CTA (published providers only). -->
     <template id="product_tamara_widget" inherit_id="website_sale.product"
               name="Tamara Product Widget">
         <xpath expr="//div[hasclass('o_wsale_product_details_content_section_cta')]" position="before">
@@ -42,7 +42,7 @@
         </xpath>
     </template>
 
-    <!-- Cart page promo widget above the Checkout button. -->
+    <!-- Cart page promo widget above the Checkout button (published providers only). -->
     <template id="cart_tamara_widget" inherit_id="website_sale.shorter_cart_summary"
               name="Tamara Cart Widget">
         <xpath expr="//t[@t-call='website_sale.navigation_buttons']" position="before">
