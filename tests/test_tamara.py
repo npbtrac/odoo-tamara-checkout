@@ -95,7 +95,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             self.url_open(url)
 
         tx.invalidate_recordset()
-        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.state, 'authorized')
         self.assertEqual(tx.tamara_order_id, self.order_data['order_id'])
         self.assertEqual(tx.tamara_order_status, 'authorised')
         self.assertEqual(tx.tamara_payment_type, 'PAY_BY_INSTALMENTS')
@@ -139,29 +139,32 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(tx.tamara_order_status, 'authorised')
         self.assertEqual(tx.tamara_payment_type, 'PAY_BY_INSTALMENTS')
 
-    def test_return_status_authorised_is_successful(self):
+    def test_return_status_authorised_is_authorized(self):
         tx = self._create_transaction(flow='redirect')
         tx._tamara_process_return({'status': 'authorised'})
-        self.assertEqual(tx.state, 'done')
-        self.assertIn('Payment successful', tx.state_message)
+        self.assertEqual(tx.state, 'authorized')
+        self.assertFalse(tx.state_message)
 
-    def test_return_status_captured_is_successful(self):
+    def test_return_status_captured_is_confirmed(self):
         tx = self._create_transaction(flow='redirect')
         tx._tamara_process_return({'status': 'fully_captured'})
         self.assertEqual(tx.state, 'done')
-        self.assertIn('Payment successful', tx.state_message)
+        self.assertFalse(tx.state_message)
 
-    def test_return_status_declined_is_failure(self):
+    def test_return_status_declined_is_canceled(self):
         tx = self._create_transaction(flow='redirect')
         tx._tamara_process_return({'status': 'declined'})
-        self.assertEqual(tx.state, 'error')
-        self.assertIn('Payment failed', tx.state_message)
-
-    def test_return_other_status_is_canceled(self):
-        tx = self._create_transaction(flow='redirect')
-        tx._tamara_process_return({'status': 'approved'})
         self.assertEqual(tx.state, 'cancel')
-        self.assertIn('Payment canceled', tx.state_message)
+
+    def test_return_status_expired_is_canceled(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'expired'})
+        self.assertEqual(tx.state, 'cancel')
+
+    def test_return_status_canceled_is_canceled(self):
+        tx = self._create_transaction(flow='redirect')
+        tx._tamara_process_return({'status': 'canceled'})
+        self.assertEqual(tx.state, 'cancel')
 
     def test_payment_labels_ksa_english(self):
         labels = self.provider._tamara_get_payment_labels(country_code='SA', lang='en_US')

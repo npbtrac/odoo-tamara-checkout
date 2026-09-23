@@ -231,29 +231,21 @@ class PaymentTransaction(models.Model):
         The return URL is only a signal. The caller must pass order details fetched directly from
         Tamara using the order ID stored when the checkout session was created.
 
+        Authorised orders become Odoo Authorized. Captured orders become Confirmed (`done`).
+        Canceled, expired, and declined orders become Canceled.
+
         :param dict order_data: The latest Tamara order details.
         :return: None
         """
         self.ensure_one()
         self._tamara_update_order_metadata(order_data)
         status = (order_data.get('status') or '').lower()
-        successful_statuses = {
-            'authorised',
-            'authorized',
-            'captured',
-            'fully_captured',
-            'partially_captured',
-        }
-        if status in successful_statuses:
-            self._set_done(
-                state_message=_("Payment successful. Tamara order status: %s.", status)
-            )
-        elif status == 'declined':
-            self._set_error(_("Payment failed. Tamara declined the order."))
-        else:
-            self._set_canceled(
-                _("Payment canceled. Tamara order status: %s.", status or _("unknown"))
-            )
+        if status in const.AUTHORIZED_STATUSES:
+            self._set_authorized()
+        elif status in const.CAPTURED_STATUSES:
+            self._set_done()
+        elif status in const.CANCELED_STATUSES:
+            self._set_canceled()
 
     def _tamara_authorise_if_needed(self, order_data):
         """Authorise the Tamara order when it is in the `approved` state.

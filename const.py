@@ -96,6 +96,13 @@ AUTHORIZED_STATUSES = {
     'authorized',
 }
 
+# Order statuses treated as a captured payment (Odoo Confirmed).
+CAPTURED_STATUSES = {
+    'captured',
+    'fully_captured',
+    'partially_captured',
+}
+
 # Order statuses treated as a cancellation or decline.
 CANCELED_STATUSES = {
     'declined',
