@@ -349,12 +349,197 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         with patch(
             'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
             return_value=self.order_data,
-        ):
+        ) as send_request:
             self._make_json_request(
                 f'{url}?tamaraToken={token}',
                 data=self.payment_data,
             )
+        send_request.assert_called_once_with(
+            'GET',
+            f"/orders/{self.order_data['order_id']}",
+            params=None,
+            data=None,
+            json=None,
+            reference=tx.reference,
+        )
         self.assertEqual(tx.state, 'done')
+
+    def _post_webhook_with_order(self, tx, order_data, event_type='order_updated'):
+        """POST a Tamara webhook for `tx` and return after fetching `order_data`."""
+        payload = {
+            **self.payment_data,
+            'event_type': event_type,
+            'order_id': self.order_data['order_id'],
+        }
+        url = self._build_url(TamaraController._webhook_url)
+        token = _sign_tamara_jwt(self.provider._tamara_get_notification_key())
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=order_data,
+        ) as send_request, patch.object(
+            type(tx), '_log_message_on_linked_documents'
+        ) as log_message:
+            self._make_json_request(f'{url}?tamaraToken={token}', data=payload)
+        return send_request, log_message
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_canceled_logs_note_without_changing_state(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='done',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        canceled_order = {
+            **self.order_data,
+            'status': 'canceled',
+            'canceled_amount': {'amount': 50.0, 'currency': 'SAR'},
+        }
+        send_request, log_message = self._post_webhook_with_order(
+            tx, canceled_order, event_type='order_canceled',
+        )
+
+        send_request.assert_called_once_with(
+            'GET',
+            f"/orders/{self.order_data['order_id']}",
+            params=None,
+            data=None,
+            json=None,
+            reference=tx.reference,
+        )
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.tamara_order_status, 'canceled')
+        self.assertIn('fully canceled', tx.state_message)
+        self.assertIn('Canceled amount: 50.00 SAR', tx.state_message)
+        log_message.assert_called_once()
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_partially_canceled_logs_note(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='authorized',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        partial_order = {
+            **self.order_data,
+            'status': 'updated',
+            'canceled_amount': {'amount': 25.5, 'currency': 'SAR'},
+        }
+        self._post_webhook_with_order(tx, partial_order, event_type='order_canceled')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'authorized')
+        self.assertEqual(tx.tamara_order_status, 'updated')
+        self.assertIn('partially canceled', tx.state_message)
+        self.assertIn('Canceled amount: 25.50 SAR', tx.state_message)
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_captured_logs_note_without_changing_state(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='authorized',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        captured_order = {
+            **self.order_data,
+            'status': 'fully_captured',
+            'captured_amount': {'amount': 111.11, 'currency': 'SAR'},
+        }
+        _, log_message = self._post_webhook_with_order(
+            tx, captured_order, event_type='order_captured',
+        )
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'authorized')
+        self.assertEqual(tx.tamara_order_status, 'fully_captured')
+        self.assertIn('fully captured', tx.state_message)
+        self.assertIn('Captured amount: 111.11 SAR', tx.state_message)
+        log_message.assert_called_once()
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_partially_captured_logs_note(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='authorized',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        captured_order = {
+            **self.order_data,
+            'status': 'partially_captured',
+            'captured_amount': {'amount': 40.0, 'currency': 'SAR'},
+        }
+        self._post_webhook_with_order(tx, captured_order, event_type='order_captured')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'authorized')
+        self.assertIn('partially captured', tx.state_message)
+        self.assertIn('Captured amount: 40.00 SAR', tx.state_message)
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_refunded_logs_note_without_changing_state(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='done',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        refunded_order = {
+            **self.order_data,
+            'status': 'fully_refunded',
+            'refunded_amount': {'amount': 111.11, 'currency': 'SAR'},
+        }
+        _, log_message = self._post_webhook_with_order(
+            tx, refunded_order, event_type='order_refunded',
+        )
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.tamara_order_status, 'fully_refunded')
+        self.assertIn('fully refunded', tx.state_message)
+        self.assertIn('Refunded amount: 111.11 SAR', tx.state_message)
+        log_message.assert_called_once()
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+    )
+    def test_webhook_partially_refunded_logs_note(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='done',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        refunded_order = {
+            **self.order_data,
+            'status': 'partially_refunded',
+            'refunded_amount': {'amount': 15.0, 'currency': 'SAR'},
+        }
+        self._post_webhook_with_order(tx, refunded_order, event_type='order_refunded')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        self.assertIn('partially refunded', tx.state_message)
+        self.assertIn('Refunded amount: 15.00 SAR', tx.state_message)
 
     @mute_logger('odoo.addons.payment_tamara.controllers.main')
     def test_webhook_rejects_invalid_token(self):

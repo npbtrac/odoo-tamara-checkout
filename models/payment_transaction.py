@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+from markupsafe import Markup
+
 from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
 from odoo.tools import urls
@@ -182,17 +184,109 @@ class PaymentTransaction(models.Model):
             'currency': self.currency_id.name,
         }
 
-    def _tamara_fetch_order(self):
+    def _tamara_fetch_order(self, order_id=None):
         """Fetch the Tamara order linked to this transaction.
 
+        :param str order_id: Optional Tamara order id. Defaults to the stored order id.
         :return: The order data.
         :rtype: dict
         """
         self.ensure_one()
-        order_id = self.tamara_order_id or self.provider_reference
+        order_id = order_id or self.tamara_order_id or self.provider_reference
         if not order_id:
             raise ValidationError(_("The Tamara order id is missing."))
         return self._send_api_request('GET', f'/orders/{order_id}')
+
+    def _tamara_log_webhook_status_note(self, order_data):
+        """Log a Tamara status note on the transaction and linked sales orders.
+
+        Used for webhook notifications when the live Tamara order status is canceled,
+        captured, or refunded (fully or partially). Does not change the Odoo payment or
+        sales order state.
+
+        :param dict order_data: The latest Tamara order details.
+        :return: Whether a note was logged for a note-only status.
+        :rtype: bool
+        """
+        self.ensure_one()
+        status = (order_data.get('status') or '').lower()
+        if status not in const.WEBHOOK_NOTE_ONLY_STATUSES:
+            return False
+
+        if status in const.FULLY_CANCELED_STATUSES:
+            action_kind = _("fully")
+            action = _("canceled")
+            amount_label = _("Canceled amount")
+            amount_keys = ('canceled_amount', 'total_amount')
+        elif status in const.PARTIALLY_CANCELED_STATUSES:
+            action_kind = _("partially")
+            action = _("canceled")
+            amount_label = _("Canceled amount")
+            amount_keys = ('canceled_amount', 'total_amount')
+        elif status in const.FULLY_CAPTURED_STATUSES:
+            action_kind = _("fully")
+            action = _("captured")
+            amount_label = _("Captured amount")
+            amount_keys = ('captured_amount', 'total_amount')
+        elif status in const.PARTIALLY_CAPTURED_STATUSES:
+            action_kind = _("partially")
+            action = _("captured")
+            amount_label = _("Captured amount")
+            amount_keys = ('captured_amount', 'total_amount')
+        elif status in const.FULLY_REFUNDED_STATUSES:
+            action_kind = _("fully")
+            action = _("refunded")
+            amount_label = _("Refunded amount")
+            amount_keys = ('refunded_amount', 'total_amount')
+        else:  # partially refunded
+            action_kind = _("partially")
+            action = _("refunded")
+            amount_label = _("Refunded amount")
+            amount_keys = ('refunded_amount', 'total_amount')
+
+        amount, currency_code = self._tamara_extract_money(order_data, amount_keys)
+        formatted_amount = f'{float(amount):.2f} {currency_code}'
+        note = _(
+            "Tamara payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s.",
+            action_kind=action_kind,
+            action=action,
+            amount_label=amount_label,
+            amount=formatted_amount,
+        )
+        self.write({
+            'tamara_order_id': (
+                order_data.get('order_id') or self.tamara_order_id or self.provider_reference
+            ),
+            'tamara_order_status': order_data.get('status') or False,
+            'tamara_payment_type': (
+                order_data.get('payment_type') or self.tamara_payment_type or False
+            ),
+            'state_message': note,
+        })
+        # payment.transaction has no chatter; state_message is the payment note.
+        # Post on linked sales orders / payments via the standard helper.
+        self.with_context(payment_backend_action=True)._log_message_on_linked_documents(
+            Markup(note)
+        )
+        _logger.info(
+            "Logged Tamara %s note on transaction %s (status=%s, amount=%s).",
+            action, self.reference, status, formatted_amount,
+        )
+        return True
+
+    def _tamara_extract_money(self, order_data, amount_keys):
+        """Extract an amount/currency pair from Tamara order data.
+
+        :param dict order_data: The Tamara order details.
+        :param tuple[str] amount_keys: Preferred money field names, in order.
+        :return: The amount and currency code.
+        :rtype: tuple[float, str]
+        """
+        for key in amount_keys:
+            money = order_data.get(key) or {}
+            if isinstance(money, dict) and money.get('amount') is not None:
+                return float(money['amount']), money.get('currency') or self.currency_id.name
+        return float(self.amount), self.currency_id.name
 
     def _tamara_can_process_return(self):
         """Return whether this transaction can query Tamara after checkout.

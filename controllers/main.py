@@ -121,22 +121,53 @@ class TamaraController(http.Controller):
     def _verify_and_process(data, verify_notification_token=False):
         """Find the transaction, optionally verify the notification token, and process the order.
 
-        Tamara webhook bodies are treated as a signal. The order is always re-fetched from the API
-        before the transaction is updated.
+        Tamara webhook bodies are treated as a signal. The `event_type` is ignored; the order is
+        always re-fetched from the API using `order_id` from the payload.
+
+        When the live Tamara status is canceled, captured, or refunded (fully or partially), only
+        a note is logged on the payment and linked sales orders. The Odoo payment state is not
+        changed for those statuses. Other statuses continue through authorise + process.
 
         :param dict data: The payment data from the return URL or webhook.
         :param bool verify_notification_token: Whether to verify the Tamara JWT.
         :return: None
         """
+        order_id = data.get('order_id')
         tx_sudo = request.env['payment.transaction'].sudo()._search_by_reference('tamara', data)
+        if not tx_sudo and order_id:
+            tx_sudo = request.env['payment.transaction'].sudo().search([
+                ('provider_code', '=', 'tamara'),
+                '|',
+                ('tamara_order_id', '=', order_id),
+                ('provider_reference', '=', order_id),
+            ], limit=1)
         if not tx_sudo:
             return
 
         if verify_notification_token:
             TamaraController._verify_notification_token(tx_sudo)
 
+        order_id = order_id or tx_sudo.tamara_order_id or tx_sudo.provider_reference
+        if not order_id:
+            _logger.warning(
+                "Received Tamara notification for transaction %s without order_id.",
+                tx_sudo.reference,
+            )
+            return
+
         try:
-            order_data = tx_sudo._tamara_fetch_order()
+            order_data = tx_sudo._tamara_fetch_order(order_id=order_id)
+        except ValidationError:
+            _logger.error(
+                "Unable to fetch Tamara order %s for transaction %s.",
+                order_id, tx_sudo.reference,
+            )
+            return
+
+        if tx_sudo._tamara_log_webhook_status_note(order_data):
+            return
+
+        try:
             order_data = tx_sudo._tamara_authorise_if_needed(order_data)
         except ValidationError:
             _logger.error("Unable to process the payment data for transaction %s.", tx_sudo.reference)

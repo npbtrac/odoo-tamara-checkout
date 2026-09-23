@@ -61,10 +61,14 @@ cp -n .env.example .env
 
 Open `http://localhost:<HTTP_EXPOSING_PORT>/shop` (default `8069`). Backend login is `admin` / `admin`.
 
-For Tamara webhooks, expose the shop with ngrok:
+For Tamara webhooks, use a public HTTPS URL (Cloudflare, ngrok, etc.):
 
 ```bash
-# Either start ngrok from the script (needs the ngrok CLI)
+# Cloudflare / reverse-proxy testing server: set the public HTTPS origin in .env
+# PUBLIC_BASE_URL=https://shop.example.com
+./scripts/run-website.sh
+
+# Or start ngrok from the script (needs the ngrok CLI)
 ./scripts/run-website.sh --ngrok
 
 # Or set NGROK_URL in .env to your HTTPS tunnel and start ngrok yourself
@@ -72,7 +76,7 @@ For Tamara webhooks, expose the shop with ngrok:
 # NGROK_ENABLED=1
 ```
 
-The script sets `web.base.url` (and the website domain) to that HTTPS URL and enables Odoo `proxy_mode`. Re-save Tamara settings so the webhook is registered against the public URL.
+The script sets `web.base.url` (and the website domain) to that HTTPS URL and enables Odoo `proxy_mode` so Cloudflare's `X-Forwarded-Proto` is trusted. Non-local `http://` public URLs are upgraded to `https://`. Re-save Tamara settings so the webhook is registered against the public URL.
 
 ## Testing instructions
 
