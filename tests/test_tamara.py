@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import requests
 
 from odoo.exceptions import ValidationError
+from odoo.fields import Command
 from odoo.tests import tagged
 from odoo.tools import mute_logger
 
@@ -56,6 +57,44 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(tx.provider_reference, checkout_data['order_id'])
         self.assertEqual(tx.tamara_order_id, checkout_data['order_id'])
         self.assertEqual(tx.tamara_checkout_url, checkout_data['checkout_url'])
+
+    def test_checkout_creation_failure_shows_generic_error_and_logs_detail(self):
+        tx = self._create_transaction(flow='redirect')
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            side_effect=ValidationError(
+                "The payment provider rejected the request.\ninvalid phone"
+            ),
+        ):
+            rendering_values = tx._get_specific_rendering_values({})
+            processing_values = tx._get_processing_values()
+
+        self.assertEqual(rendering_values, {})
+        self.assertEqual(tx.state, 'error')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Cannot create the checkout session', tx.state_message)
+        self.assertIn('invalid phone', tx.state_message)
+        self.assertEqual(
+            processing_values['state_message'],
+            "Tamara payment is unavailable at this time, please choose another payment option",
+        )
+
+    def test_checkout_missing_order_id_uses_generic_customer_error(self):
+        tx = self._create_transaction(flow='redirect')
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value={'checkout_url': 'https://checkout.tamara.co/example'},
+        ):
+            tx._get_specific_rendering_values({})
+            processing_values = tx._get_processing_values()
+
+        self.assertEqual(tx.state, 'error')
+        self.assertIn('Cannot create the checkout session', tx.state_message)
+        self.assertIn('Tamara did not return an order ID.', tx.state_message)
+        self.assertEqual(
+            processing_values['state_message'],
+            "Tamara payment is unavailable at this time, please choose another payment option",
+        )
 
     def test_fetch_order_uses_stored_tamara_order_id(self):
         tx = self._create_transaction(
@@ -413,6 +452,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         tx.invalidate_recordset()
         self.assertEqual(tx.state, 'done')
         self.assertEqual(tx.tamara_order_status, 'canceled')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('fully canceled', tx.state_message)
         self.assertIn('Canceled amount: 50.00 SAR', tx.state_message)
         log_message.assert_called_once()
@@ -438,6 +478,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         tx.invalidate_recordset()
         self.assertEqual(tx.state, 'authorized')
         self.assertEqual(tx.tamara_order_status, 'updated')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('partially canceled', tx.state_message)
         self.assertIn('Canceled amount: 25.50 SAR', tx.state_message)
 
@@ -464,6 +505,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         tx.invalidate_recordset()
         self.assertEqual(tx.state, 'authorized')
         self.assertEqual(tx.tamara_order_status, 'fully_captured')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('fully captured', tx.state_message)
         self.assertIn('Captured amount: 111.11 SAR', tx.state_message)
         log_message.assert_called_once()
@@ -514,6 +556,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         tx.invalidate_recordset()
         self.assertEqual(tx.state, 'done')
         self.assertEqual(tx.tamara_order_status, 'fully_refunded')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('fully refunded', tx.state_message)
         self.assertIn('Refunded amount: 111.11 SAR', tx.state_message)
         log_message.assert_called_once()
@@ -595,3 +638,88 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(self.provider._tamara_get_api_token(), 'dummy_live_api_token')
         self.assertEqual(self.provider._tamara_get_notification_key(), 'dummy_live_notification_key')
         self.assertIn('api.tamara.co', self.provider._build_request_url('checkout'))
+
+    def _create_sale_order_with_tamara_tx(self, **tx_values):
+        """Create a confirmed sale order linked to a Tamara payment transaction."""
+        product = self.env['product.product'].create({
+            'name': 'Tamara Cancel Product',
+            'list_price': self.amount,
+            'type': 'consu',
+        })
+        sale_order = self.env['sale.order'].create({
+            'partner_id': self.partner.id,
+            'currency_id': self.currency.id,
+            'order_line': [Command.create({
+                'product_id': product.id,
+                'product_uom_qty': 1,
+                'price_unit': self.amount,
+            })],
+        })
+        sale_order.action_confirm()
+        tx = self._create_transaction(
+            'redirect',
+            state='authorized',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+            sale_order_ids=[Command.set(sale_order.ids)],
+            amount=sale_order.amount_total,
+            **tx_values,
+        )
+        return sale_order, tx
+
+    def test_sale_order_cancel_cancels_tamara_and_logs_success(self):
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        cancel_amount = float(sale_order.amount_total)
+        currency_name = sale_order.currency_id.name
+        cancel_response = {
+            'order_id': self.order_data['order_id'],
+            'status': 'canceled',
+            'canceled_amount': {
+                'amount': cancel_amount,
+                'currency': currency_name,
+            },
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=cancel_response,
+        ) as send_request:
+            sale_order.action_cancel()
+
+        send_request.assert_called_once_with(
+            'POST',
+            f"/orders/{self.order_data['order_id']}/cancel",
+            params=None,
+            data=None,
+            json={
+                'total_amount': {
+                    'amount': cancel_amount,
+                    'currency': currency_name,
+                },
+            },
+            reference=tx.reference,
+        )
+        self.assertEqual(sale_order.state, 'cancel')
+        self.assertEqual(tx.state, 'authorized')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Payment is Canceled successfully on Tamara side', tx.state_message)
+        self.assertIn(f'{cancel_amount:.2f} {currency_name}', tx.state_message)
+
+    def test_sale_order_cancel_logs_tamara_failure(self):
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            side_effect=ValidationError("order already captured"),
+        ):
+            sale_order.action_cancel()
+
+        self.assertEqual(sale_order.state, 'cancel')
+        self.assertEqual(tx.state, 'authorized')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Cancel action on Tamara side failed', tx.state_message)
+        self.assertIn('order already captured', tx.state_message)
+
+    def test_tamara_note_prefix_is_translated_separately(self):
+        prefix = self.env['payment.transaction']._tamara_note_prefix()
+        note = self.env['payment.transaction']._tamara_format_note("Payment was fully canceled.")
+        self.assertEqual(prefix, "Tamara:")
+        self.assertEqual(note, "Tamara: Payment was fully canceled.")

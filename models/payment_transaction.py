@@ -59,17 +59,17 @@ class PaymentTransaction(models.Model):
         try:
             checkout_data = self._send_api_request('POST', '/checkout', json=payload)
         except ValidationError as error:
-            self._set_error(str(error))
-            return {}
+            return self._tamara_fail_checkout_creation(error)
+
+        if not checkout_data:
+            return self._tamara_fail_checkout_creation(_("Empty response"))
 
         order_id = checkout_data.get('order_id')
         checkout_url = checkout_data.get('checkout_url')
         if not order_id:
-            self._set_error(_("Tamara did not return an order ID."))
-            return {}
+            return self._tamara_fail_checkout_creation(_("Tamara did not return an order ID."))
         if not checkout_url:
-            self._set_error(_("Tamara did not return a checkout URL."))
-            return {}
+            return self._tamara_fail_checkout_creation(_("Tamara did not return a checkout URL."))
         # Keep provider_reference populated for Odoo's generic transaction UI and store explicit
         # Tamara metadata so the return route can retrieve the order without trusting query data.
         self.write({
@@ -78,6 +78,38 @@ class PaymentTransaction(models.Model):
             'tamara_checkout_url': checkout_url,
         })
         return {'api_url': checkout_url}
+
+    def _get_processing_values(self):
+        """Override of `payment` to show a generic checkout error to the customer."""
+        values = super()._get_processing_values()
+        if (
+            self.provider_code == 'tamara'
+            and self.state == 'error'
+            and self.state_message
+            and 'Cannot create the checkout session' in self.state_message
+        ):
+            values['state_message'] = _(
+                "Tamara payment is unavailable at this time, please choose another payment option"
+            )
+        return values
+
+    def _tamara_fail_checkout_creation(self, tamara_error):
+        """Mark checkout creation as failed for the customer and log the Tamara error.
+
+        The payment keeps a detailed Tamara-prefixed note. The customer-facing payment form
+        receives a generic unavailable message via `_get_processing_values`.
+
+        :param Exception|str tamara_error: The Tamara API error or reason.
+        :return: Empty rendering values so no redirect is attempted.
+        :rtype: dict
+        """
+        self.ensure_one()
+        note = self._tamara_format_note(
+            _("Cannot create the checkout session, error from Tamara: %s", tamara_error)
+        )
+        # `_set_error` stores the note on the payment and logs it on linked documents.
+        self._set_error(note)
+        return {}
 
     def _tamara_prepare_checkout_payload(self):
         """Create the payload for the checkout session request.
@@ -197,6 +229,47 @@ class PaymentTransaction(models.Model):
             raise ValidationError(_("The Tamara order id is missing."))
         return self._send_api_request('GET', f'/orders/{order_id}')
 
+    @api.model
+    def _tamara_note_prefix(self):
+        """Return the translated Tamara note prefix.
+
+        :return: The prefix used before Tamara chatter / payment notes.
+        :rtype: str
+        """
+        return _("Tamara:")
+
+    @api.model
+    def _tamara_format_note(self, message):
+        """Prefix a Tamara note with the translated `Tamara:` label.
+
+        :param str message: The note body without the Tamara prefix.
+        :return: The prefixed note.
+        :rtype: str
+        """
+        return f'{self._tamara_note_prefix()} {message}'
+
+    def _tamara_log_note(self, message, *, sale_orders=None):
+        """Log a Tamara-prefixed note on the payment and linked sales orders.
+
+        :param str message: The note body without the Tamara prefix.
+        :param sale.order sale_orders: Optional sales orders to notify in addition to linked ones.
+        :return: The prefixed note that was logged.
+        :rtype: str
+        """
+        self.ensure_one()
+        note = self._tamara_format_note(message)
+        self.write({'state_message': note})
+        body = Markup(note)
+        self.with_context(payment_backend_action=True)._log_message_on_linked_documents(body)
+        for order in sale_orders or self.env['sale.order']:
+            if order not in (self.sale_order_ids | self.source_transaction_id.sale_order_ids):
+                order.sudo().message_post(
+                    body=body,
+                    message_type='comment',
+                    subtype_xmlid='mail.mt_note',
+                )
+        return note
+
     def _tamara_log_webhook_status_note(self, order_data):
         """Log a Tamara status note on the transaction and linked sales orders.
 
@@ -245,9 +318,12 @@ class PaymentTransaction(models.Model):
             amount_keys = ('refunded_amount', 'total_amount')
 
         amount, currency_code = self._tamara_extract_money(order_data, amount_keys)
+        if amount is None:
+            amount = self.amount
+            currency_code = self.currency_id.name
         formatted_amount = f'{float(amount):.2f} {currency_code}'
-        note = _(
-            "Tamara payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s.",
+        message = _(
+            "Payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s.",
             action_kind=action_kind,
             action=action,
             amount_label=amount_label,
@@ -261,18 +337,65 @@ class PaymentTransaction(models.Model):
             'tamara_payment_type': (
                 order_data.get('payment_type') or self.tamara_payment_type or False
             ),
-            'state_message': note,
         })
-        # payment.transaction has no chatter; state_message is the payment note.
-        # Post on linked sales orders / payments via the standard helper.
-        self.with_context(payment_backend_action=True)._log_message_on_linked_documents(
-            Markup(note)
-        )
+        self._tamara_log_note(message)
         _logger.info(
             "Logged Tamara %s note on transaction %s (status=%s, amount=%s).",
             action, self.reference, status, formatted_amount,
         )
         return True
+
+    def _tamara_cancel_from_sale_order(self, sale_order):
+        """Cancel this Tamara order for the given sales order amount and log the result.
+
+        Does not change the Odoo payment transaction state.
+
+        :param sale.order sale_order: The sales order being canceled.
+        :return: None
+        """
+        self.ensure_one()
+        order_id = self.tamara_order_id or self.provider_reference
+        if not order_id:
+            return
+
+        cancel_amount = sale_order.amount_total
+        currency_code = (sale_order.currency_id or self.currency_id).name
+        payload = {
+            'total_amount': {
+                'amount': float(cancel_amount),
+                'currency': currency_code,
+            },
+        }
+        try:
+            cancel_data = self._send_api_request(
+                'POST', f'/orders/{order_id}/cancel', json=payload
+            )
+        except ValidationError as error:
+            self._tamara_log_note(
+                _(
+                    "Cancel action on Tamara side failed, error from Tamara: %s",
+                    error,
+                ),
+                sale_orders=sale_order,
+            )
+            return
+
+        canceled_amount, response_currency = self._tamara_extract_money(
+            cancel_data, ('canceled_amount', 'total_amount')
+        )
+        if canceled_amount is None:
+            canceled_amount = cancel_amount
+            response_currency = currency_code
+        formatted_amount = f'{float(canceled_amount):.2f} {response_currency}'
+        if cancel_data.get('status'):
+            self.tamara_order_status = cancel_data['status']
+        self._tamara_log_note(
+            _(
+                "Payment is Canceled successfully on Tamara side, Canceled amount is %s",
+                formatted_amount,
+            ),
+            sale_orders=sale_order,
+        )
 
     def _tamara_extract_money(self, order_data, amount_keys):
         """Extract an amount/currency pair from Tamara order data.
@@ -280,13 +403,13 @@ class PaymentTransaction(models.Model):
         :param dict order_data: The Tamara order details.
         :param tuple[str] amount_keys: Preferred money field names, in order.
         :return: The amount and currency code.
-        :rtype: tuple[float, str]
+        :rtype: tuple[float|None, str]
         """
         for key in amount_keys:
             money = order_data.get(key) or {}
             if isinstance(money, dict) and money.get('amount') is not None:
                 return float(money['amount']), money.get('currency') or self.currency_id.name
-        return float(self.amount), self.currency_id.name
+        return None, self.currency_id.name
 
     def _tamara_can_process_return(self):
         """Return whether this transaction can query Tamara after checkout.
