@@ -13,7 +13,7 @@
 
     <!-- Root app entry on the main admin menu. -->
     <menuitem id="menu_tamara_root"
-              name="Tamara"
+              name="Payment Gateway - Tamara"
               sequence="65"
               web_icon="payment_tamara,static/description/icon.png"
               groups="base.group_system"/>

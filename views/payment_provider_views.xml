@@ -44,6 +44,11 @@
                     <field name="tamara_live_webhook_url" string="Webhook URL" widget="CopyClipboardChar"/>
                 </group>
             </group>
+            <group name="provider_credentials" position="after">
+                <group string="Order Capture" name="tamara_order_capture" invisible="code != 'tamara'">
+                    <field name="tamara_capture_trigger"/>
+                </group>
+            </group>
         </field>
     </record>
 

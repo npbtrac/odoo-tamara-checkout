@@ -89,6 +89,17 @@ class PaymentProvider(models.Model):
         readonly=True,
         groups='base.group_system',
     )
+    tamara_capture_trigger = fields.Selection(
+        string="Action to trigger Order Capture",
+        selection=[
+            ('none', "Select an action"),
+            ('fully_invoice', "Fully invoice"),
+            ('fully_delivered', "Fully Delivered"),
+        ],
+        default='none',
+        help="When the selected sale-order event happens, automatically fully capture the "
+             "linked Tamara order.",
+    )
 
     # === COMPUTE METHODS === #
 

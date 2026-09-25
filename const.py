@@ -111,12 +111,17 @@ CANCELED_STATUSES = {
     'cancelled',
 }
 
-# Tamara statuses that only log a webhook note (no Odoo payment/SO state change).
-# Full cancel uses `canceled`; partial cancel before capture uses `updated` (Tamara docs).
-FULLY_CANCELED_STATUSES = {
+# Tamara statuses that cancel the Odoo payment on webhook (if not already canceled)
+# and log a note on the linked sale order.
+WEBHOOK_CANCEL_PAYMENT_STATUSES = {
+    'declined',
+    'expired',
     'canceled',
     'cancelled',
 }
+
+# Tamara statuses that only log a webhook note (no Odoo payment/SO state change).
+# Partial cancel before capture uses `updated` (Tamara docs).
 PARTIALLY_CANCELED_STATUSES = {
     'updated',
     'partially_canceled',
@@ -135,8 +140,7 @@ PARTIALLY_REFUNDED_STATUSES = {
     'partially_refunded',
 }
 WEBHOOK_NOTE_ONLY_STATUSES = (
-    FULLY_CANCELED_STATUSES
-    | PARTIALLY_CANCELED_STATUSES
+    PARTIALLY_CANCELED_STATUSES
     | FULLY_CAPTURED_STATUSES
     | PARTIALLY_CAPTURED_STATUSES
     | FULLY_REFUNDED_STATUSES

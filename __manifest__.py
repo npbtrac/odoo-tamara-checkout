@@ -7,7 +7,7 @@
     'description': " ",  # Non-empty string to avoid loading the README file.
     'author': 'Tamara',
     'website': 'https://tamara.co',
-    'depends': ['payment', 'website_sale'],
+    'depends': ['payment', 'website_sale', 'sale_stock'],
     'data': [
         # The provider record references the form templates, and the menus
         # reference the provider record, so keep this load order.

@@ -270,12 +270,63 @@ class PaymentTransaction(models.Model):
                 )
         return note
 
+    def _tamara_handle_webhook_cancel_status(self, order_data):
+        """Cancel the Odoo payment and log a sale-order note for terminal Tamara failures.
+
+        Handles `declined`, `expired`, and `canceled` / `cancelled`. Cancels the payment
+        when it is not already canceled (Odoo only allows cancel from draft/pending/authorized).
+        Always leaves a `Tamara:` note on the payment and linked sales orders.
+
+        :param dict order_data: The latest Tamara order details.
+        :return: Whether this status was handled.
+        :rtype: bool
+        """
+        self.ensure_one()
+        status = (order_data.get('status') or '').lower()
+        if status not in const.WEBHOOK_CANCEL_PAYMENT_STATUSES:
+            return False
+
+        if status == 'declined':
+            outcome = _("declined")
+        elif status == 'expired':
+            outcome = _("expired")
+        else:
+            outcome = _("cancelled")
+
+        self.write({
+            'tamara_order_id': (
+                order_data.get('order_id') or self.tamara_order_id or self.provider_reference
+            ),
+            'tamara_order_status': order_data.get('status') or False,
+            'tamara_payment_type': (
+                order_data.get('payment_type') or self.tamara_payment_type or False
+            ),
+        })
+
+        message = _("Tamara payment for the order is %(outcome)s.", outcome=outcome)
+        note = self._tamara_format_note(message)
+
+        if self.state == 'cancel':
+            self._tamara_log_note(message)
+        else:
+            self._set_canceled(note)
+            if self.state != 'cancel':
+                # Cancel refused (e.g. payment already Confirmed) — still leave the note.
+                self._tamara_log_note(message)
+            # On success, `_set_canceled` already stores state_message and logs on linked docs.
+
+        _logger.info(
+            "Handled Tamara webhook cancel status %s on transaction %s (payment state=%s).",
+            status, self.reference, self.state,
+        )
+        return True
+
     def _tamara_log_webhook_status_note(self, order_data):
         """Log a Tamara status note on the transaction and linked sales orders.
 
-        Used for webhook notifications when the live Tamara order status is canceled,
-        captured, or refunded (fully or partially). Does not change the Odoo payment or
-        sales order state.
+        Used for webhook notifications when the live Tamara order status is partially
+        canceled, captured, or refunded (fully or partially). Does not change the Odoo
+        payment or sales order state.
 
         :param dict order_data: The latest Tamara order details.
         :return: Whether a note was logged for a note-only status.
@@ -286,12 +337,7 @@ class PaymentTransaction(models.Model):
         if status not in const.WEBHOOK_NOTE_ONLY_STATUSES:
             return False
 
-        if status in const.FULLY_CANCELED_STATUSES:
-            action_kind = _("fully")
-            action = _("canceled")
-            amount_label = _("Canceled amount")
-            amount_keys = ('canceled_amount', 'total_amount')
-        elif status in const.PARTIALLY_CANCELED_STATUSES:
+        if status in const.PARTIALLY_CANCELED_STATUSES:
             action_kind = _("partially")
             action = _("canceled")
             amount_label = _("Canceled amount")
@@ -393,6 +439,64 @@ class PaymentTransaction(models.Model):
             _(
                 "Payment is Canceled successfully on Tamara side, Canceled amount is %s",
                 formatted_amount,
+            ),
+            sale_orders=sale_order,
+        )
+
+    def _tamara_capture_from_sale_order(self, sale_order):
+        """Fully capture this Tamara order and log the result on the sales order.
+
+        Does not change the Odoo payment transaction state unless it is still authorized,
+        in which case it is marked done after a successful capture.
+
+        :param sale.order sale_order: The sales order that triggered the capture.
+        :return: None
+        """
+        self.ensure_one()
+        order_id = self.tamara_order_id or self.provider_reference
+        if not order_id:
+            return
+
+        payload = {
+            'order_id': order_id,
+            'total_amount': self._tamara_money(self.amount),
+            'shipping_info': {
+                'shipped_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'shipping_company': self.company_id.name or 'Odoo',
+                'tracking_number': sale_order.name or self.reference,
+            },
+        }
+        try:
+            capture_data = self._send_api_request('POST', '/payments/capture', json=payload)
+        except ValidationError as error:
+            self._tamara_log_note(
+                _(
+                    "Capture action on Tamara side failed, error from Tamara: %s",
+                    error,
+                ),
+                sale_orders=sale_order,
+            )
+            return
+
+        capture_id = capture_data.get('capture_id') or ''
+        captured_amount, response_currency = self._tamara_extract_money(
+            capture_data, ('captured_amount', 'total_amount')
+        )
+        if captured_amount is None:
+            captured_amount = self.amount
+            response_currency = self.currency_id.name
+        formatted_amount = f'{float(captured_amount):.2f} {response_currency}'
+        if capture_data.get('status'):
+            self.tamara_order_status = capture_data['status']
+        else:
+            self.tamara_order_status = 'fully_captured'
+        if self.state == 'authorized':
+            self._set_done()
+        self._tamara_log_note(
+            _(
+                "Order captured successfully. Capture amount: %(amount)s. Capture Id: %(capture_id)s.",
+                amount=formatted_amount,
+                capture_id=capture_id,
             ),
             sale_orders=sale_order,
         )

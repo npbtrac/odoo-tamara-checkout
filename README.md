@@ -1,32 +1,146 @@
 # Tamara
 
-## Technical details
+Odoo payment provider for [Tamara](https://tamara.co) buy-now-pay-later (instalments), aimed at Saudi Arabia, the UAE, and the GCC.
 
 API: [Checkout API](https://docs.tamara.co/docs/direct-online-checkout)
 
-This module integrates Tamara using the generic payment with redirection flow provided by the
-`payment` module, plus website ecommerce widgets and pre-checkout eligibility.
+Depends on `payment`, `website_sale`, and `sale_stock`.
 
-## Supported features
+## User Guides
 
-- Payment with redirection flow (`POST /checkout` → redirect to `checkout_url`)
-- Webhook registration on provider settings save (`POST /webhooks`) with stored `webhook_id`
-- Webhook notifications (JWT verification)
-- Order authorisation after customer approval
-- Manual capture
-- Full and partial refunds
-- Cancellation of authorised orders
-- Product page promo widget above Add to Cart (`tamara-summary`, inline-type `2`; amount updates on variant change)
-- Cart page promo widget above Checkout (`tamara-summary`, inline-type `5`)
-- Product and cart widgets are only rendered when the Tamara provider is published (Published toggle on the provider); unpublishing hides them and skips the widget script
-- Checkout payment labels (KSA Sharia copy vs other countries, EN/AR) + checkout widget (inline-type `6`)
-- Pre-checkout eligibility ([docs](https://docs.tamara.co/reference/pre-checkout-eligibility)): 2s timeout, fail-open on API errors; Tamara is hidden when billing phone or email is missing (no API call)
-- Pre-checkout eligibility gating (`POST /pre-checkout/v1/eligibility`, 2s timeout, fail-open)
+### 1. Enable the Tamara addon
 
-## Not implemented features
+1. Log in to Odoo as an **Administrator** (Settings access).
+2. Open **Apps** via **Home menu (⚙ / app switcher) → Apps**.
+3. Remove the **Apps** filter on the search bar if needed so you can see installed and available modules.
+4. Search for **Tamara** (technical name: `payment_tamara`).
+5. Click **Activate** / **Install**.
+6. Wait until installation finishes. Odoo will also load its dependencies (`payment`, `website_sale`, `sale_stock`).
 
-- Tokenization
-- Express checkout
+After install, Tamara appears as a payment provider and as the **Payment Gateway - Tamara** app in the main menu.
+
+### 2. Access Tamara settings
+
+Open the Tamara provider form via any of these paths:
+
+- **Home menu → Payment Gateway - Tamara → Settings**
+- **Home menu → Website → Configuration → eCommerce → Tamara**
+- **Home menu → Accounting → Configuration → Payment Providers → Tamara**
+- **Home menu → Website → Configuration → Payment Providers → Tamara**
+
+All of these open the same Tamara payment provider settings form.
+
+### 3. Configure Tamara
+
+Open settings first (**Home menu → Payment Gateway - Tamara → Settings**), then on the form:
+
+1. **Mode**
+   - Choose **Sandbox** for testing, or **Live** (Enabled) for production.
+   - Sandbox and Live keep separate credentials.
+
+2. **Credentials** (from the Tamara merchant portal)
+   - Fill the Sandbox or Live group under **Configuration** on the provider form:
+     - **API Token (Merchant Token)**
+     - **Notification Token** (used to verify webhooks)
+     - **Public Key** (used for frontend widgets)
+
+3. **State / availability**
+   - On the same form, set the provider so it is available on the website (published / enabled as required for your Odoo payment setup).
+   - Under **Configuration → Availability**, restrict **countries** / **currencies** if needed. Tamara supports **SA / AE** and **SAR / AED**.
+
+4. **Order Capture** (optional)
+   - On the form, under **Order Capture**:
+     - **Action to trigger Order Capture**:
+       - **Select an action** — no automatic capture (use manual capture, or leave authorised until you capture later)
+       - **Fully invoice** — fully capture on Tamara when the sale order is fully invoiced
+       - **Fully Delivered** — fully capture on Tamara when the sale order is fully delivered
+
+5. **Save**
+   - Click **Save** on the provider form.
+   - Saving registers the webhook URL (`/payment/tamara/webhook`) with Tamara and stores the webhook id/URL on the form.
+   - For real webhook delivery, Odoo must be reachable over **HTTPS** (public URL / ngrok / reverse proxy). After changing the public URL, open **Payment Gateway - Tamara → Settings** again and **Save** so the webhook is re-registered.
+
+If save fails with **Wrong API Token**, check the API token for the selected mode (Sandbox vs Live).
+
+### 4. Checkout with Tamara on the website
+
+1. Open the shop (`/shop`) and add products to the cart.
+2. Go to **Checkout** and fill in the customer details.
+   - A valid **phone** and **email** are required; otherwise Tamara is hidden.
+   - Billing country/currency should match Tamara (e.g. Saudi Arabia + SAR, or UAE + AED).
+3. On the payment step, select **Tamara** (instalments). Promo widgets may also appear on the product and cart pages when the provider is published.
+4. Confirm / pay. The customer is redirected to Tamara’s checkout page.
+5. Complete the Tamara payment flow (approve the instalment plan).
+6. After success, Tamara redirects back to Odoo (`/payment/tamara/return`). Odoo re-fetches the order from Tamara and updates the payment (typically **Authorized** after approval/authorisation).
+7. The linked sale order is confirmed according to Odoo’s normal payment post-processing.
+8. Capture happens later either:
+   - automatically (if you configured **Fully invoice** or **Fully Delivered**), or
+   - manually via **Capture Transaction** on the authorized payment.
+
+If checkout creation fails, the customer sees a generic unavailable message; admins see a detailed `Tamara:` note on the payment / sale order.
+## Features
+
+### Checkout & payment
+
+- Redirect payment flow: `POST /checkout` → customer redirected to Tamara `checkout_url`
+- Stores Tamara `order_id` and checkout URL on the payment transaction
+- Customer return route `/payment/tamara/return` re-fetches the order from Tamara (does not trust query status)
+- Checkout uses `PAY_BY_INSTALMENTS` (3 instalments)
+- Checkout creation failures:
+  - Customer sees a generic message: *Tamara payment is unavailable at this time, please choose another payment option*
+  - Payment / linked sale order get a detailed note: `Tamara: Cannot create the checkout session, error from Tamara: …`
+
+### Webhooks
+
+- Registers `/payment/tamara/webhook` with Tamara on provider settings save (`POST /webhooks`)
+- Verifies Tamara notification JWT (HS256) via `tamaraToken` or `Authorization: Bearer`
+- Ignores `event_type`; always re-fetches the order by payload `order_id`
+- On `approved`: auto-authorises the order on Tamara, then updates the Odoo payment
+- On `declined` / `expired` / `canceled`: cancels the Odoo payment (if not already canceled) and logs `Tamara: Tamara payment for the order is declined/expired/cancelled` on the payment and sale order
+- For capture / refund / partial cancel statuses: **logs a `Tamara:` note only** — does not change Odoo payment or sale order state
+- Registered events: `order_approved`, `order_declined`, `order_authorised`, `order_canceled`, `order_captured`, `order_refunded`, `order_expired`
+
+### Capture, void & refund
+
+- Manual capture (full amount) via **Capture Transaction** on an authorized payment / sale order → `POST /payments/capture`
+- Automatic full capture when the provider setting **Action to trigger Order Capture** matches:
+  - **Fully invoice** — when the sale order becomes fully invoiced
+  - **Fully Delivered** — when the sale order becomes fully delivered
+  - Success note: `Tamara: Order captured successfully. Capture amount: …. Capture Id: …`
+  - Failure note: `Tamara: Capture action on Tamara side failed, error from Tamara: …`
+- Void authorised payments → `POST /orders/{id}/cancel`
+- Refunds (including partial) → `POST /payments/simplified-refund/{id}`
+
+### Sale order cancel
+
+- When a sale order linked to a Tamara payment is cancelled in Odoo:
+  - Cancels the Tamara order for the sale order amount (`POST /orders/{id}/cancel`)
+  - Logs success or failure as a `Tamara:` note on the payment and sale order
+  - Does not change the Odoo payment transaction state
+
+### Website widgets & eligibility
+
+- Product page promo widget (above Add to Cart)
+- Cart page promo widget (above Checkout)
+- Checkout payment option labels (EN/AR; KSA Sharia copy vs other countries) + inline widget
+- Widgets only render when the Tamara provider is **published**
+- Pre-checkout eligibility (`POST /pre-checkout/v1/eligibility`, 2s timeout, fail-open)
+- Hides Tamara when billing phone or email is missing
+
+### Provider settings
+
+- Sandbox / Live modes with separate API token, notification token, and public key
+- Automatic webhook registration on save (stores webhook id + URL)
+- **Action to trigger Order Capture**: Select an action / Fully invoice / Fully Delivered
+- Admin menu: **Payment Gateway - Tamara → Settings**
+
+### Scope & limits
+
+| Supported | Not implemented |
+|-----------|-----------------|
+| Countries: SA, AE | Tokenization |
+| Currencies: SAR, AED | Express checkout |
+| Locales: `en_US`, `ar_SA` | |
 
 ## Demo store setup (macOS / Ubuntu)
 

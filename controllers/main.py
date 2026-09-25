@@ -124,9 +124,10 @@ class TamaraController(http.Controller):
         Tamara webhook bodies are treated as a signal. The `event_type` is ignored; the order is
         always re-fetched from the API using `order_id` from the payload.
 
-        When the live Tamara status is canceled, captured, or refunded (fully or partially), only
-        a note is logged on the payment and linked sales orders. The Odoo payment state is not
-        changed for those statuses. Other statuses continue through authorise + process.
+        When the live Tamara status is declined, expired, or canceled, the Odoo payment is
+        canceled (if not already) and a `Tamara:` note is logged on the payment and sale order.
+        Captured / refunded / partially canceled statuses only log a note (no state change).
+        Other statuses continue through authorise + process.
 
         :param dict data: The payment data from the return URL or webhook.
         :param bool verify_notification_token: Whether to verify the Tamara JWT.
@@ -162,6 +163,9 @@ class TamaraController(http.Controller):
                 "Unable to fetch Tamara order %s for transaction %s.",
                 order_id, tx_sudo.reference,
             )
+            return
+
+        if tx_sudo._tamara_handle_webhook_cancel_status(order_data):
             return
 
         if tx_sudo._tamara_log_webhook_status_note(order_data):

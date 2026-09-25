@@ -424,18 +424,18 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
     @mute_logger(
         'odoo.addons.payment_tamara.controllers.main',
         'odoo.addons.payment_tamara.models.payment_transaction',
+        'odoo.addons.payment.models.payment_transaction',
     )
-    def test_webhook_canceled_logs_note_without_changing_state(self):
+    def test_webhook_canceled_cancels_authorized_payment(self):
         tx = self._create_transaction(
             'redirect',
-            state='done',
+            state='authorized',
             provider_reference=self.order_data['order_id'],
             tamara_order_id=self.order_data['order_id'],
         )
         canceled_order = {
             **self.order_data,
             'status': 'canceled',
-            'canceled_amount': {'amount': 50.0, 'currency': 'SAR'},
         }
         send_request, log_message = self._post_webhook_with_order(
             tx, canceled_order, event_type='order_canceled',
@@ -450,12 +450,69 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             reference=tx.reference,
         )
         tx.invalidate_recordset()
-        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.state, 'cancel')
         self.assertEqual(tx.tamara_order_status, 'canceled')
         self.assertTrue(tx.state_message.startswith('Tamara:'))
-        self.assertIn('fully canceled', tx.state_message)
-        self.assertIn('Canceled amount: 50.00 SAR', tx.state_message)
-        log_message.assert_called_once()
+        self.assertIn('Tamara payment for the order is cancelled', tx.state_message)
+        log_message.assert_called()
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+        'odoo.addons.payment.models.payment_transaction',
+    )
+    def test_webhook_declined_cancels_pending_payment(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='pending',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        declined_order = {**self.order_data, 'status': 'declined'}
+        self._post_webhook_with_order(tx, declined_order, event_type='order_declined')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'cancel')
+        self.assertIn('Tamara payment for the order is declined', tx.state_message)
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+        'odoo.addons.payment.models.payment_transaction',
+    )
+    def test_webhook_expired_cancels_pending_payment(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='pending',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        expired_order = {**self.order_data, 'status': 'expired'}
+        self._post_webhook_with_order(tx, expired_order, event_type='order_expired')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'cancel')
+        self.assertIn('Tamara payment for the order is expired', tx.state_message)
+
+    @mute_logger(
+        'odoo.addons.payment_tamara.controllers.main',
+        'odoo.addons.payment_tamara.models.payment_transaction',
+        'odoo.addons.payment.models.payment_transaction',
+    )
+    def test_webhook_canceled_on_done_payment_logs_note_without_cancel(self):
+        tx = self._create_transaction(
+            'redirect',
+            state='done',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        canceled_order = {**self.order_data, 'status': 'canceled'}
+        self._post_webhook_with_order(tx, canceled_order, event_type='order_canceled')
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Tamara payment for the order is cancelled', tx.state_message)
 
     @mute_logger(
         'odoo.addons.payment_tamara.controllers.main',
@@ -639,13 +696,17 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(self.provider._tamara_get_notification_key(), 'dummy_live_notification_key')
         self.assertIn('api.tamara.co', self.provider._build_request_url('checkout'))
 
-    def _create_sale_order_with_tamara_tx(self, **tx_values):
+    def _create_sale_order_with_tamara_tx(self, product_type='service', **tx_values):
         """Create a confirmed sale order linked to a Tamara payment transaction."""
-        product = self.env['product.product'].create({
-            'name': 'Tamara Cancel Product',
+        product_vals = {
+            'name': 'Tamara Capture Product',
             'list_price': self.amount,
-            'type': 'consu',
-        })
+            'type': product_type,
+            'invoice_policy': 'order',
+        }
+        if product_type == 'consu' and 'is_storable' in self.env['product.product']._fields:
+            product_vals['is_storable'] = True
+        product = self.env['product.product'].create(product_vals)
         sale_order = self.env['sale.order'].create({
             'partner_id': self.partner.id,
             'currency_id': self.currency.id,
@@ -717,6 +778,97 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('Cancel action on Tamara side failed', tx.state_message)
         self.assertIn('order already captured', tx.state_message)
+
+    def test_fully_invoice_triggers_tamara_capture(self):
+        self.provider.tamara_capture_trigger = 'fully_invoice'
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        capture_amount = float(tx.amount)
+        currency_name = tx.currency_id.name
+        capture_response = {
+            'capture_id': 'cap_invoice_123',
+            'order_id': self.order_data['order_id'],
+            'status': 'fully_captured',
+            'captured_amount': {
+                'amount': capture_amount,
+                'currency': currency_name,
+            },
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=capture_response,
+        ) as send_request:
+            sale_order._create_invoices()
+            self.assertEqual(sale_order.invoice_status, 'invoiced')
+
+        send_request.assert_called_once()
+        self.assertEqual(send_request.call_args.args[0], 'POST')
+        self.assertEqual(send_request.call_args.args[1], '/payments/capture')
+        self.assertEqual(send_request.call_args.kwargs['json']['order_id'], self.order_data['order_id'])
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.tamara_order_status, 'fully_captured')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Order captured successfully', tx.state_message)
+        self.assertIn(f'{capture_amount:.2f} {currency_name}', tx.state_message)
+        self.assertIn('cap_invoice_123', tx.state_message)
+
+    def test_fully_invoice_capture_failure_logs_api_response(self):
+        self.provider.tamara_capture_trigger = 'fully_invoice'
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            side_effect=ValidationError("order not authorised"),
+        ):
+            sale_order._create_invoices()
+            self.assertEqual(sale_order.invoice_status, 'invoiced')
+
+        self.assertEqual(tx.state, 'authorized')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Capture action on Tamara side failed', tx.state_message)
+        self.assertIn('order not authorised', tx.state_message)
+
+    def test_fully_delivered_triggers_tamara_capture(self):
+        self.provider.tamara_capture_trigger = 'fully_delivered'
+        sale_order, tx = self._create_sale_order_with_tamara_tx(product_type='consu')
+        self.assertTrue(sale_order.picking_ids)
+        capture_amount = float(tx.amount)
+        currency_name = tx.currency_id.name
+        capture_response = {
+            'capture_id': 'cap_delivery_456',
+            'order_id': self.order_data['order_id'],
+            'status': 'fully_captured',
+            'captured_amount': {
+                'amount': capture_amount,
+                'currency': currency_name,
+            },
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=capture_response,
+        ) as send_request:
+            picking = sale_order.picking_ids
+            picking.move_ids.write({'quantity': 1, 'picked': True})
+            picking.button_validate()
+            self.assertEqual(sale_order.delivery_status, 'full')
+
+        send_request.assert_called_once()
+        self.assertEqual(send_request.call_args.args[1], '/payments/capture')
+        self.assertEqual(tx.state, 'done')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Order captured successfully', tx.state_message)
+        self.assertIn('cap_delivery_456', tx.state_message)
+
+    def test_capture_not_triggered_when_action_not_selected(self):
+        self.provider.tamara_capture_trigger = 'none'
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+        ) as send_request:
+            sale_order._create_invoices()
+            self.assertEqual(sale_order.invoice_status, 'invoiced')
+
+        send_request.assert_not_called()
+        self.assertEqual(tx.state, 'authorized')
+        self.assertFalse(tx.state_message)
 
     def test_tamara_note_prefix_is_translated_separately(self):
         prefix = self.env['payment.transaction']._tamara_note_prefix()
