@@ -8,6 +8,8 @@
         <field name="module_id" ref="base.module_payment_tamara"/>
         <field name="redirect_form_view_id" ref="redirect_form"/>
         <field name="inline_form_view_id" ref="inline_form"/>
+        <!-- Authorised Tamara orders reserve funds; capture is configured separately. -->
+        <field name="capture_manually" eval="True"/>
         <field name="payment_method_ids"
                eval="[Command.set([
                          ref('payment.payment_method_tamara'),

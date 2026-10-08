@@ -1,16 +1,19 @@
-import logging
+import sys
+from pprint import pformat
 
 import requests
 
-from odoo import _, api, fields, models
+from odoo import _, api, fields, models, release
 from odoo.exceptions import ValidationError
+from odoo.modules.module import Manifest
 from odoo.tools import urls
 
+from odoo.addons.payment.logging import get_payment_logger
 from odoo.addons.payment_tamara import const
 from odoo.addons.payment_tamara.controllers.main import TamaraController
 
 
-_logger = logging.getLogger(__name__)
+_logger = get_payment_logger(__name__, const.SENSITIVE_KEYS)
 
 
 class PaymentProvider(models.Model):
@@ -100,6 +103,16 @@ class PaymentProvider(models.Model):
         help="When the selected sale-order event happens, automatically fully capture the "
              "linked Tamara order.",
     )
+    tamara_debug_mode = fields.Boolean(
+        string="Debug mode",
+        default=False,
+        help="When enabled, log Tamara API requests and responses to the server log "
+             "(with a 'Tamara -' prefix).",
+    )
+    tamara_debug_info = fields.Text(
+        string="Versions",
+        compute='_compute_tamara_debug_info',
+    )
 
     # === COMPUTE METHODS === #
 
@@ -133,6 +146,23 @@ class PaymentProvider(models.Model):
             'support_manual_capture': 'full_only',
             'support_refund': 'partial',
         })
+
+    def _compute_tamara_debug_info(self):
+        info = self._tamara_format_debug_info()
+        for provider in self:
+            provider.tamara_debug_info = info if provider.code == 'tamara' else False
+
+    @api.model
+    def _tamara_format_debug_info(self):
+        """Return the Odoo / Python / Tamara addon versions for the settings form."""
+        manifest = Manifest.for_addon('payment_tamara', display_warning=False)
+        addon_version = manifest.version if manifest else ''
+        return _(
+            "Odoo: %(odoo)s\nPython: %(python)s\nTamara Payment: %(addon)s",
+            odoo=release.version,
+            python='.'.join(str(part) for part in sys.version_info[:3]),
+            addon=addon_version,
+        )
 
     def _get_supported_currencies(self):
         """Override of `payment` to return the supported currencies."""
@@ -493,12 +523,14 @@ class PaymentProvider(models.Model):
             "Registering Tamara webhook for provider %s: POST %s (url=%s)",
             self.id, url, webhook_url,
         )
+        self._tamara_debug_log_request('POST', url, payload, headers=headers)
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=10)
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             _logger.warning("Could not reach Tamara to register webhook for provider %s.", self.id)
             return None
 
+        self._tamara_debug_log_response(response)
         webhook_id = None
         try:
             data = response.json()
@@ -549,30 +581,83 @@ class PaymentProvider(models.Model):
             })
         return webhook_id
 
-    def _tamara_normalize_phone(self, phone):
-        """Return digits-only phone for Tamara eligibility (e.g. 966501234567).
+    def _tamara_normalize_phone(self, phone, country=None):
+        """Return phone for Tamara eligibility: country calling code + national number.
 
-        :param str phone: Raw phone value.
+        Builds ``{phone_code}{national}`` where ``national`` has no leading trunk ``0``
+        and no repeated country calling code. Non-digit characters (including ``+``) are
+        stripped.
+
+        Examples for Saudi Arabia (``phone_code`` 966):
+
+        * ``+966512345678`` → ``966512345678``
+        * ``0512345678`` → ``966512345678``
+        * ``512345678`` → ``966512345678``
+
+        :param str phone: Raw phone value from the checkout form or partner.
+        :param res.country country: Billing country used for the calling code.
         :return: Normalized phone, or empty string.
         :rtype: str
         """
         if not phone:
             return ''
-        return ''.join(ch for ch in str(phone) if ch.isdigit())
+        digits = ''.join(ch for ch in str(phone) if ch.isdigit())
+        if not digits:
+            return ''
 
-    def _tamara_partner_phone(self, partner):
+        phone_code = str(country.phone_code) if country and country.phone_code else ''
+        if not phone_code:
+            return digits
+
+        if digits.startswith(phone_code):
+            national = digits[len(phone_code):]
+        else:
+            national = digits
+        national = national.lstrip('0')
+        if not national:
+            return ''
+        return f'{phone_code}{national}'
+
+    def _tamara_partner_phone(self, partner, country=None):
         """Return the best phone number available on the partner.
 
         :param res.partner partner: Customer partner.
+        :param res.country country: Optional country override for the calling code.
         :return: Normalized phone, or empty string.
         :rtype: str
         """
         if not partner:
             return ''
-        return self._tamara_normalize_phone(partner.phone or partner.mobile)
+        return self._tamara_normalize_phone(
+            partner.phone or partner.mobile,
+            country=country or partner.country_id,
+        )
+
+    def _tamara_eligibility_country(self, partner=None, country=None):
+        """Return the billing country used to format the eligibility phone number.
+
+        Uses only the billing/invoice partner country (or its parent / commercial partner
+        when the invoice address itself has no country). Does not infer country from
+        currency or company.
+
+        :param res.partner partner: Billing partner, if any.
+        :param res.country country: Optional country override.
+        :return: Country recordset (possibly empty).
+        :rtype: res.country
+        """
+        if country:
+            return country
+        if not partner:
+            return self.env['res.country']
+        if partner.country_id:
+            return partner.country_id
+        if partner.parent_id and partner.parent_id.country_id:
+            return partner.parent_id.country_id
+        return partner.commercial_partner_id.country_id
 
     def _tamara_is_customer_eligible(
-        self, amount, currency, partner=None, phone=None, email=None, timeout=None,
+        self, amount, currency, partner=None, phone=None, email=None, country=None,
+        timeout=None,
     ):
         """Return whether Tamara should be shown for the customer (pre-checkout eligibility).
 
@@ -582,16 +667,19 @@ class PaymentProvider(models.Model):
 
         :param float amount: Order amount.
         :param res.currency currency: Order currency.
-        :param res.partner partner: Customer partner, if any.
+        :param res.partner partner: Billing partner, if any.
         :param str phone: Optional phone override.
         :param str email: Optional email override.
+        :param res.country country: Optional billing country override for phone formatting.
         :param float timeout: Optional request timeout override (seconds).
         :return: Whether Tamara is eligible.
         :rtype: bool
         """
         self.ensure_one()
         partner = partner or self.env['res.partner']
-        phone = self._tamara_normalize_phone(phone) or self._tamara_partner_phone(partner)
+        country = self._tamara_eligibility_country(partner=partner, country=country)
+        raw_phone = phone or (partner.phone or partner.mobile if partner else '')
+        phone = self._tamara_normalize_phone(raw_phone, country=country)
         email = (email or (partner.email if partner else '') or '').strip()
         # Require phone + email before showing Tamara; skip the API when either is missing.
         if not phone or not email:
@@ -612,10 +700,12 @@ class PaymentProvider(models.Model):
         url = self._build_request_url('/pre-checkout/v1/eligibility')
         headers = self._build_request_headers('POST', '/pre-checkout/v1/eligibility', payload)
         request_timeout = const.ELIGIBILITY_TIMEOUT if timeout is None else timeout
+        self._tamara_debug_log_request('POST', url, payload, headers=headers)
         try:
             response = requests.post(
                 url, json=payload, headers=headers, timeout=request_timeout,
             )
+            self._tamara_debug_log_response(response)
             if not response.ok:
                 _logger.info(
                     "Tamara eligibility non-OK for provider %s phone=%s: %s",
@@ -685,6 +775,77 @@ class PaymentProvider(models.Model):
             'Authorization': f'Bearer {self._tamara_get_api_token()}',
             'Content-Type': 'application/json',
         }
+
+    def _log_request(self, method, url, payload, *, reference=None):
+        """Override of `payment` to gate Tamara API request logs behind Debug mode."""
+        if self.code != 'tamara':
+            return super()._log_request(method, url, payload, reference=reference)
+        headers = (
+            self._build_request_headers(method, '', payload)
+            if self._tamara_debug_enabled() else None
+        )
+        self._tamara_debug_log_request(
+            method, url, payload, headers=headers, reference=reference,
+        )
+
+    def _log_response(self, response, *, reference=None):
+        """Override of `payment` to gate Tamara API response logs behind Debug mode."""
+        if self.code != 'tamara':
+            return super()._log_response(response, reference=reference)
+        self._tamara_debug_log_response(response, reference=reference)
+
+    def _tamara_debug_enabled(self):
+        """Return whether Tamara Debug mode should log API traffic for this provider."""
+        return bool(self.code == 'tamara' and self.tamara_debug_mode)
+
+    def _tamara_debug_log_request(self, method, url, payload, *, headers=None, reference=None):
+        """Log an outgoing Tamara API request when Debug mode is enabled."""
+        if not self._tamara_debug_enabled():
+            return
+        if reference:
+            message = (
+                "Tamara - Sending %(method)s API request to %(url)s for transaction %(ref)s."
+            )
+            values = {'method': method, 'url': url, 'ref': reference}
+        else:
+            message = (
+                "Tamara - Sending %(method)s API request to %(url)s for provider %(p_id)s."
+            )
+            values = {'method': method, 'url': url, 'p_id': self.id}
+        if headers:
+            message += " Headers:\n%(headers)s"
+            values['headers'] = pformat(headers)
+        if payload:
+            message += " Payload:\n%(payload)s"
+            values['payload'] = pformat(payload)
+        _logger.info(message, values)
+
+    def _tamara_debug_log_response(self, response, *, reference=None):
+        """Log a Tamara API response when Debug mode is enabled."""
+        if not self._tamara_debug_enabled():
+            return
+        if reference:
+            message = (
+                "Tamara - Received HTTP %(code)s %(status)s API response from %(url)s"
+                " for transaction %(ref)s.\n%(data)s"
+            )
+        else:
+            message = (
+                "Tamara - Received HTTP %(code)s %(status)s API response from %(url)s"
+                " for provider %(p_id)s.\n%(data)s"
+            )
+        values = {
+            'code': response.status_code,
+            'status': response.reason,
+            'url': response.url,
+            'ref': reference,
+            'p_id': self.id,
+            'data': response.text,
+        }
+        if response.ok:
+            _logger.info(message, values)
+        else:
+            _logger.error(message, values)
 
     def _parse_response_error(self, response):
         """Override of `payment` to parse the error message."""

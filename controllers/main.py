@@ -6,7 +6,7 @@ import pprint
 from werkzeug.exceptions import Forbidden
 
 from odoo import http
-from odoo.exceptions import ValidationError
+from odoo.exceptions import UserError, ValidationError
 from odoo.http import request
 
 from odoo.addons.payment.logging import get_payment_logger
@@ -56,7 +56,14 @@ class TamaraController(http.Controller):
                 "Unable to retrieve the Tamara order details. Please contact support."
             )
         else:
-            tx_sudo._tamara_process_return(order_data)
+            try:
+                tx_sudo._tamara_process_return(order_data)
+            except UserError as error:
+                # PDF/mail failures (e.g. missing wkhtmltopdf) must not 422 the customer return.
+                _logger.warning(
+                    "Tamara return handling hit UserError for transaction %s: %s",
+                    tx_sudo.reference, error,
+                )
         return request.redirect('/payment/status')
 
     @http.route(_webhook_url, type='http', auth='public', methods=['POST'], csrf=False)
@@ -75,13 +82,17 @@ class TamaraController(http.Controller):
             payload = {}
         payload.update(data)
         _logger.info("notification received from Tamara with data:\n%s", pprint.pformat(payload))
-        self._verify_and_process(payload, verify_notification_token=True)
+        try:
+            self._verify_and_process(payload, verify_notification_token=True)
+        except UserError as error:
+            # Acknowledge anyway so Tamara does not retry forever on PDF/mail failures.
+            _logger.warning("Tamara webhook handling hit UserError: %s", error)
         return ''  # Acknowledge the notification.
 
     @http.route(_eligibility_url, type='jsonrpc', auth='public', methods=['POST'])
     def tamara_pre_checkout_eligibility(
         self, provider_id, amount, currency_id, partner_id=None, phone=None, email=None,
-        sale_order_id=None, **_kwargs
+        country_id=None, sale_order_id=None, **_kwargs
     ):
         """Check Tamara pre-checkout eligibility for the current checkout form values.
 
@@ -94,6 +105,7 @@ class TamaraController(http.Controller):
         :param int partner_id: Optional partner id.
         :param str phone: Optional phone number from the checkout form.
         :param str email: Optional email from the checkout form.
+        :param int country_id: Optional country id from the checkout form (phone calling code).
         :param int sale_order_id: Optional website sale order id (uses invoice partner phone).
         :return: Whether Tamara should be shown.
         :rtype: dict
@@ -107,12 +119,14 @@ class TamaraController(http.Controller):
         if order:
             partner = order.partner_invoice_id or order.partner_id or partner
         currency = request.env['res.currency'].sudo().browse(currency_id).exists()
+        country = request.env['res.country'].sudo().browse(country_id).exists()
         is_eligible = provider_sudo._tamara_is_customer_eligible(
             amount=amount,
             currency=currency,
             partner=partner,
             phone=phone,
             email=email,
+            country=country,
             timeout=const.ELIGIBILITY_TIMEOUT,
         )
         return {'is_eligible': is_eligible}
@@ -177,6 +191,9 @@ class TamaraController(http.Controller):
             _logger.error("Unable to process the payment data for transaction %s.", tx_sudo.reference)
         else:
             tx_sudo._process('tamara', order_data)
+            # Confirm the linked sale order immediately; status-page polling often never runs
+            # after an external Tamara redirect / webhook-only update.
+            tx_sudo._tamara_ensure_post_process()
 
     @staticmethod
     def _verify_notification_token(tx_sudo):

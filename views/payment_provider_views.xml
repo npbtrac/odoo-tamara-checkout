@@ -48,6 +48,10 @@
                 <group string="Order Capture" name="tamara_order_capture" invisible="code != 'tamara'">
                     <field name="tamara_capture_trigger"/>
                 </group>
+                <group string="Troubleshooting" name="tamara_troubleshooting" invisible="code != 'tamara'">
+                    <field name="tamara_debug_mode"/>
+                    <field name="tamara_debug_info" readonly="1"/>
+                </group>
             </group>
         </field>
     </record>

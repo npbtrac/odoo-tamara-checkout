@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from markupsafe import Markup
 
 from odoo import _, api, fields, models
-from odoo.exceptions import ValidationError
+from odoo.exceptions import UserError, ValidationError
 from odoo.tools import urls
 
 from odoo.addons.payment import utils as payment_utils
@@ -368,13 +368,25 @@ class PaymentTransaction(models.Model):
             amount = self.amount
             currency_code = self.currency_id.name
         formatted_amount = f'{float(amount):.2f} {currency_code}'
-        message = _(
-            "Payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s.",
-            action_kind=action_kind,
-            action=action,
-            amount_label=amount_label,
-            amount=formatted_amount,
-        )
+        capture_id = self._tamara_extract_capture_id(order_data)
+        if status in const.CAPTURED_STATUSES and capture_id:
+            message = _(
+                "Payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s. "
+                "Capture Id: %(capture_id)s.",
+                action_kind=action_kind,
+                action=action,
+                amount_label=amount_label,
+                amount=formatted_amount,
+                capture_id=capture_id,
+            )
+        else:
+            message = _(
+                "Payment was %(action_kind)s %(action)s. %(amount_label)s: %(amount)s.",
+                action_kind=action_kind,
+                action=action,
+                amount_label=amount_label,
+                amount=formatted_amount,
+            )
         self.write({
             'tamara_order_id': (
                 order_data.get('order_id') or self.tamara_order_id or self.provider_reference
@@ -426,20 +438,12 @@ class PaymentTransaction(models.Model):
             )
             return
 
-        canceled_amount, response_currency = self._tamara_extract_money(
-            cancel_data, ('canceled_amount', 'total_amount')
-        )
-        if canceled_amount is None:
-            canceled_amount = cancel_amount
-            response_currency = currency_code
-        formatted_amount = f'{float(canceled_amount):.2f} {response_currency}'
         if cancel_data.get('status'):
             self.tamara_order_status = cancel_data['status']
-        self._tamara_log_note(
-            _(
-                "Payment is Canceled successfully on Tamara side, Canceled amount is %s",
-                formatted_amount,
-            ),
+        self._tamara_log_cancel_success(
+            cancel_data,
+            fallback_amount=cancel_amount,
+            fallback_currency=currency_code,
             sale_orders=sale_order,
         )
 
@@ -478,7 +482,60 @@ class PaymentTransaction(models.Model):
             )
             return
 
-        capture_id = capture_data.get('capture_id') or ''
+        if capture_data.get('status'):
+            self.tamara_order_status = capture_data['status']
+        else:
+            self.tamara_order_status = 'fully_captured'
+        if self.state == 'authorized':
+            self._set_done()
+        self._tamara_log_capture_success(capture_data, sale_orders=sale_order)
+
+    def _tamara_extract_capture_id(self, capture_data):
+        """Return the Tamara capture id from a capture or order payload.
+
+        :param dict capture_data: Tamara capture response or order details.
+        :return: The capture id, or an empty string.
+        :rtype: str
+        """
+        if not capture_data:
+            return ''
+        capture_id = capture_data.get('capture_id')
+        if capture_id:
+            return str(capture_id)
+        captures = (capture_data.get('transactions') or {}).get('captures') or []
+        if captures and isinstance(captures[-1], dict):
+            latest = captures[-1]
+            return str(latest.get('capture_id') or latest.get('id') or '')
+        return ''
+
+    def _tamara_extract_cancel_id(self, cancel_data):
+        """Return the Tamara cancel id from a cancel or order payload.
+
+        :param dict cancel_data: Tamara cancel response or order details.
+        :return: The cancel id, or an empty string.
+        :rtype: str
+        """
+        if not cancel_data:
+            return ''
+        cancel_id = cancel_data.get('cancel_id')
+        if cancel_id:
+            return str(cancel_id)
+        cancels = (cancel_data.get('transactions') or {}).get('cancels') or []
+        if cancels and isinstance(cancels[-1], dict):
+            latest = cancels[-1]
+            return str(latest.get('cancel_id') or latest.get('id') or '')
+        return ''
+
+    def _tamara_log_capture_success(self, capture_data, *, sale_orders=None):
+        """Log Capture Id and captured amount on the payment and sale order chatter.
+
+        :param dict capture_data: Tamara capture API response (or order data with capture info).
+        :param sale.order sale_orders: Optional sales orders to notify in addition to linked ones.
+        :return: The prefixed note that was logged.
+        :rtype: str
+        """
+        self.ensure_one()
+        capture_id = self._tamara_extract_capture_id(capture_data)
         captured_amount, response_currency = self._tamara_extract_money(
             capture_data, ('captured_amount', 'total_amount')
         )
@@ -486,20 +543,48 @@ class PaymentTransaction(models.Model):
             captured_amount = self.amount
             response_currency = self.currency_id.name
         formatted_amount = f'{float(captured_amount):.2f} {response_currency}'
-        if capture_data.get('status'):
-            self.tamara_order_status = capture_data['status']
-        else:
-            self.tamara_order_status = 'fully_captured'
-        if self.state == 'authorized':
-            self._set_done()
-        self._tamara_log_note(
+        return self._tamara_log_note(
             _(
                 "Order captured successfully. Capture amount: %(amount)s. Capture Id: %(capture_id)s.",
                 amount=formatted_amount,
                 capture_id=capture_id,
             ),
-            sale_orders=sale_order,
+            sale_orders=sale_orders,
         )
+
+    def _tamara_log_cancel_success(
+        self, cancel_data, *, fallback_amount=None, fallback_currency=None, sale_orders=None,
+    ):
+        """Log Cancel Id and canceled amount on the payment and sale order chatter.
+
+        :param dict cancel_data: Tamara cancel API response (or order data with cancel info).
+        :param float fallback_amount: Amount to use when the response has none.
+        :param str fallback_currency: Currency code to use when the response has none.
+        :param sale.order sale_orders: Optional sales orders to notify in addition to linked ones.
+        :return: The prefixed note that was logged.
+        :rtype: str
+        """
+        self.ensure_one()
+        cancel_id = self._tamara_extract_cancel_id(cancel_data)
+        canceled_amount, response_currency = self._tamara_extract_money(
+            cancel_data, ('canceled_amount', 'total_amount')
+        )
+        if canceled_amount is None:
+            canceled_amount = fallback_amount if fallback_amount is not None else self.amount
+            response_currency = fallback_currency or self.currency_id.name
+        formatted_amount = f'{float(canceled_amount):.2f} {response_currency}'
+        if cancel_id:
+            message = _(
+                "Payment canceled successfully. Canceled amount: %(amount)s. Cancel Id: %(cancel_id)s.",
+                amount=formatted_amount,
+                cancel_id=cancel_id,
+            )
+        else:
+            message = _(
+                "Payment canceled successfully. Canceled amount: %(amount)s.",
+                amount=formatted_amount,
+            )
+        return self._tamara_log_note(message, sale_orders=sale_orders)
 
     def _tamara_extract_money(self, order_data, amount_keys):
         """Extract an amount/currency pair from Tamara order data.
@@ -555,6 +640,9 @@ class PaymentTransaction(models.Model):
         Authorised orders become Odoo Authorized. Captured orders become Confirmed (`done`).
         Canceled, expired, and declined orders become Canceled.
 
+        Successful payments also run Odoo payment post-processing so the linked sale order is
+        confirmed without waiting for `/payment/status` polling or the post-process cron.
+
         :param dict order_data: The latest Tamara order details.
         :return: None
         """
@@ -567,6 +655,79 @@ class PaymentTransaction(models.Model):
             self._set_done()
         elif status in const.CANCELED_STATUSES:
             self._set_canceled()
+        self._tamara_ensure_post_process()
+
+    def _tamara_confirm_linked_sale_orders(self):
+        """Confirm linked quotations after a successful Tamara payment.
+
+        Confirms when the paid/authorized amount covers the quotation. Unlike sale's default
+        payment post-processing, a pending online signature does not block confirmation once
+        Tamara has authorized/captured the payment. Confirmation email/PDF is skipped so a
+        missing wkhtmltopdf cannot roll back the SO confirm.
+
+        :return: The confirmed sales orders.
+        :rtype: sale.order
+        """
+        self.ensure_one()
+        confirmed_orders = self.env['sale.order']
+        if len(self.sale_order_ids) != 1:
+            return confirmed_orders
+        quotation = self.sale_order_ids.filtered(lambda so: so.state in ('draft', 'sent'))
+        if not quotation or not quotation._is_confirmation_amount_reached():
+            return confirmed_orders
+        quotation.with_context(send_email=False).action_confirm()
+        _logger.info(
+            "Tamara confirmed sale order %s for transaction %s.",
+            quotation.name, self.reference,
+        )
+        return quotation
+
+    def _tamara_ensure_post_process(self):
+        """Confirm the linked sale order, then run Odoo payment post-processing.
+
+        Sale confirmation is done first and independently of `_post_process()`, because Odoo's
+        post-process also sends PDF emails that can fail (e.g. missing wkhtmltopdf). Without a
+        savepoint those failures can poison the HTTP request (422 on return/webhook) even when
+        caught, and can leave the payment authorized while the SO stays draft.
+
+        :return: None
+        """
+        self.ensure_one()
+        if self.state not in ('authorized', 'done'):
+            return
+
+        self._tamara_confirm_linked_sale_orders()
+
+        if self.is_post_processed:
+            return
+        try:
+            # Isolate mail/PDF side effects so a missing wkhtmltopdf cannot abort the request.
+            with self.env.cr.savepoint():
+                self._post_process()
+        except UserError as error:
+            _logger.warning(
+                "Tamara post-processing UserError for transaction %s (SO already confirmed "
+                "when possible): %s",
+                self.reference, error,
+            )
+            # Do not leave a poisoned post-process flag; cron can retry the mail/PDF later.
+            self.is_post_processed = False
+            cron = self.env.ref(
+                'payment.cron_post_process_payment_tx', raise_if_not_found=False,
+            )
+            if cron:
+                cron._trigger()
+        except Exception:  # noqa: BLE001 - keep return/webhook flows resilient
+            _logger.exception(
+                "Tamara post-processing failed for transaction %s; cron may retry.",
+                self.reference,
+            )
+            self.is_post_processed = False
+            cron = self.env.ref(
+                'payment.cron_post_process_payment_tx', raise_if_not_found=False,
+            )
+            if cron:
+                cron._trigger()
 
     def _tamara_authorise_if_needed(self, order_data):
         """Authorise the Tamara order when it is in the `approved` state.
@@ -586,30 +747,58 @@ class PaymentTransaction(models.Model):
         if self.provider_code != 'tamara':
             return super()._send_capture_request()
 
-        source_tx = self.source_transaction_id
+        source_tx = self.source_transaction_id or self
+        order_id = source_tx.tamara_order_id or source_tx.provider_reference
+        sale_order = source_tx.sale_order_ids[:1]
         payload = {
-            'order_id': source_tx.provider_reference,
+            'order_id': order_id,
             'total_amount': self._tamara_money(self.amount),
             'shipping_info': {
                 'shipped_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'shipping_company': self.company_id.name or 'Odoo',
-                'tracking_number': source_tx.reference,
+                'tracking_number': (sale_order.name if sale_order else source_tx.reference),
             },
         }
         capture_data = self._send_api_request('POST', '/payments/capture', json=payload)
         self._process('tamara', capture_data)
+        if capture_data.get('status'):
+            source_tx.tamara_order_status = capture_data['status']
+        else:
+            source_tx.tamara_order_status = 'fully_captured'
+        # Log Capture Id / amount on the source payment and linked sale order chatter.
+        source_tx._tamara_log_capture_success(capture_data, sale_orders=sale_order)
 
     def _send_void_request(self):
         """Override of `payment` to cancel an authorised Tamara order."""
         if self.provider_code != 'tamara':
             return super()._send_void_request()
 
-        source_tx = self.source_transaction_id
+        source_tx = self.source_transaction_id or self
+        order_id = source_tx.tamara_order_id or source_tx.provider_reference
+        sale_order = source_tx.sale_order_ids[:1]
         payload = {'total_amount': self._tamara_money(self.amount)}
-        cancel_data = self._send_api_request(
-            'POST', f'/orders/{source_tx.provider_reference}/cancel', json=payload
-        )
+        try:
+            cancel_data = self._send_api_request(
+                'POST', f'/orders/{order_id}/cancel', json=payload
+            )
+        except ValidationError as error:
+            source_tx._tamara_log_note(
+                _(
+                    "Cancel action on Tamara side failed, error from Tamara: %s",
+                    error,
+                ),
+                sale_orders=sale_order,
+            )
+            raise
         self._process('tamara', cancel_data)
+        if cancel_data.get('status'):
+            source_tx.tamara_order_status = cancel_data['status']
+        source_tx._tamara_log_cancel_success(
+            cancel_data,
+            fallback_amount=self.amount,
+            fallback_currency=self.currency_id.name,
+            sale_orders=sale_order,
+        )
 
     def _send_refund_request(self):
         """Override of `payment` to send a refund request to Tamara."""
@@ -666,11 +855,11 @@ class PaymentTransaction(models.Model):
         payment_status = (payment_data.get('status') or '').lower()
         if payment_status in const.PENDING_STATUSES:
             self._set_pending()
-        elif payment_status in const.DONE_STATUSES:
-            if self.provider_id.capture_manually and payment_status in const.AUTHORIZED_STATUSES:
-                self._set_authorized()
-            else:
-                self._set_done()
+        elif payment_status in const.AUTHORIZED_STATUSES:
+            # Tamara "authorised" means funds are reserved; capture is a later step.
+            self._set_authorized()
+        elif payment_status in const.CAPTURED_STATUSES:
+            self._set_done()
         elif payment_status in const.CANCELED_STATUSES:
             self._set_canceled(_("Cancelled payment with status: %s", payment_status))
         elif payment_status in ('fully_refunded', 'partially_refunded'):

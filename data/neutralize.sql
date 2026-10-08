@@ -9,4 +9,5 @@ UPDATE payment_provider
        tamara_live_notification_key = NULL,
        tamara_live_public_key = NULL,
        tamara_live_webhook_id = NULL,
-       tamara_live_webhook_url = NULL;
+       tamara_live_webhook_url = NULL,
+       tamara_debug_mode = FALSE;

@@ -180,20 +180,117 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
 
     def test_return_status_authorised_is_authorized(self):
         tx = self._create_transaction(flow='redirect')
-        tx._tamara_process_return({'status': 'authorised'})
+        with patch.object(type(tx), '_post_process') as post_process:
+            tx._tamara_process_return({'status': 'authorised'})
         self.assertEqual(tx.state, 'authorized')
         self.assertFalse(tx.state_message)
+        post_process.assert_called_once()
 
     def test_return_status_captured_is_confirmed(self):
         tx = self._create_transaction(flow='redirect')
-        tx._tamara_process_return({'status': 'fully_captured'})
+        with patch.object(type(tx), '_post_process') as post_process:
+            tx._tamara_process_return({'status': 'fully_captured'})
         self.assertEqual(tx.state, 'done')
         self.assertFalse(tx.state_message)
+        post_process.assert_called_once()
 
     def test_return_status_declined_is_canceled(self):
         tx = self._create_transaction(flow='redirect')
-        tx._tamara_process_return({'status': 'declined'})
+        with patch.object(type(tx), '_post_process') as post_process:
+            tx._tamara_process_return({'status': 'declined'})
         self.assertEqual(tx.state, 'cancel')
+        post_process.assert_not_called()
+
+    def test_return_authorised_confirms_linked_sale_order(self):
+        """Authorised Tamara payments must confirm the linked quotation (not only the TX)."""
+        product = self.env['product.product'].create({
+            'name': 'Tamara Confirm Product',
+            'list_price': self.amount,
+            'type': 'service',
+            'invoice_policy': 'order',
+        })
+        sale_order = self.env['sale.order'].create({
+            'partner_id': self.partner.id,
+            'currency_id': self.currency.id,
+            'order_line': [Command.create({
+                'product_id': product.id,
+                'product_uom_qty': 1,
+                'price_unit': self.amount,
+            })],
+        })
+        tx = self._create_transaction(
+            'redirect',
+            sale_order_ids=[Command.set(sale_order.ids)],
+            amount=sale_order.amount_total,
+        )
+        self.assertEqual(sale_order.state, 'draft')
+        with patch.object(type(tx), '_post_process'):
+            tx._tamara_process_return({'status': 'authorised'})
+        self.assertEqual(tx.state, 'authorized')
+        self.assertEqual(sale_order.state, 'sale')
+
+    def test_post_process_wkhtmltopdf_error_keeps_so_confirmed(self):
+        """Missing wkhtmltopdf must not abort return handling or roll back SO confirm."""
+        from odoo.exceptions import UserError
+
+        product = self.env['product.product'].create({
+            'name': 'Tamara PDF Fail Product',
+            'list_price': self.amount,
+            'type': 'service',
+            'invoice_policy': 'order',
+        })
+        sale_order = self.env['sale.order'].create({
+            'partner_id': self.partner.id,
+            'currency_id': self.currency.id,
+            'order_line': [Command.create({
+                'product_id': product.id,
+                'product_uom_qty': 1,
+                'price_unit': self.amount,
+            })],
+        })
+        tx = self._create_transaction(
+            'redirect',
+            sale_order_ids=[Command.set(sale_order.ids)],
+            amount=sale_order.amount_total,
+        )
+        with patch.object(
+            type(tx),
+            '_post_process',
+            side_effect=UserError(
+                "Unable to find Wkhtmltopdf on this system. The PDF can not be created."
+            ),
+        ):
+            tx._tamara_process_return({'status': 'authorised'})
+        self.assertEqual(tx.state, 'authorized')
+        self.assertEqual(sale_order.state, 'sale')
+        self.assertFalse(tx.is_post_processed)
+
+    def test_return_http_ok_when_post_process_raises_user_error(self):
+        """Customer return must redirect, not 422, when payment mail PDF fails."""
+        from odoo.exceptions import UserError
+
+        tx = self._create_transaction(
+            flow='redirect',
+            provider_reference=self.order_data['order_id'],
+            tamara_order_id=self.order_data['order_id'],
+        )
+        self.provider.with_context(tamara_skip_webhook_register=True).write({
+            'is_published': True,
+        })
+        url = self._build_url(f'{TamaraController._return_url}?ref={tx.reference}')
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=self.order_data,
+        ), patch(
+            'odoo.addons.payment_tamara.models.payment_transaction.PaymentTransaction._post_process',
+            side_effect=UserError(
+                "Unable to find Wkhtmltopdf on this system. The PDF can not be created."
+            ),
+        ):
+            response = self.url_open(url)
+        self.assertNotEqual(response.status_code, 422)
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'authorized')
 
     def test_return_status_expired_is_canceled(self):
         tx = self._create_transaction(flow='redirect')
@@ -220,6 +317,124 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(labels['title'], 'Tamara')
         self.assertEqual(labels['description'], 'Monthly Payments.')
 
+    def test_normalize_phone_ksa_strips_plus_country_code(self):
+        sa = self.env.ref('base.sa')
+        self.assertEqual(
+            self.provider._tamara_normalize_phone('+966512345678', country=sa),
+            '966512345678',
+        )
+
+    def test_normalize_phone_ksa_national_with_trunk_zero(self):
+        sa = self.env.ref('base.sa')
+        self.assertEqual(
+            self.provider._tamara_normalize_phone('0512345678', country=sa),
+            '966512345678',
+        )
+        self.assertEqual(
+            self.provider._tamara_normalize_phone('512345678', country=sa),
+            '966512345678',
+        )
+
+    def test_normalize_phone_ksa_strips_zero_after_country_code(self):
+        sa = self.env.ref('base.sa')
+        self.assertEqual(
+            self.provider._tamara_normalize_phone('+9660512345678', country=sa),
+            '966512345678',
+        )
+
+    def test_normalize_phone_ae_national_with_trunk_zero(self):
+        ae = self.env.ref('base.ae')
+        self.assertEqual(
+            self.provider._tamara_normalize_phone('0501234567', country=ae),
+            '971501234567',
+        )
+
+    def test_eligibility_sends_normalized_phone(self):
+        sa = self.env.ref('base.sa')
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.reason = 'OK'
+        mock_response.url = 'https://api-sandbox.tamara.co/pre-checkout/v1/eligibility'
+        mock_response.text = '{"is_eligible": true}'
+        mock_response.json.return_value = {'is_eligible': True}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ) as post:
+            self.assertTrue(self.provider._tamara_is_customer_eligible(
+                amount=100,
+                currency=self.currency,
+                phone='+966512345678',
+                email='buyer@example.com',
+                country=sa,
+            ))
+        self.assertEqual(
+            post.call_args.kwargs['json']['customer']['phone_number'],
+            '966512345678',
+        )
+
+    def test_eligibility_adds_country_code_from_billing_country(self):
+        """Billing phone uses the billing address country calling code, not currency."""
+        ae = self.env.ref('base.ae')
+        aed = self._enable_currency('AED')
+        partner = self.env['res.partner'].create({
+            'name': 'Billing AE',
+            'email': 'billing@example.com',
+            'phone': '0511223344',
+            'country_id': ae.id,
+        })
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.reason = 'OK'
+        mock_response.url = 'https://api-sandbox.tamara.co/pre-checkout/v1/eligibility'
+        mock_response.text = '{"is_eligible": true}'
+        mock_response.json.return_value = {'is_eligible': True}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ) as post:
+            self.assertTrue(self.provider._tamara_is_customer_eligible(
+                amount=100,
+                currency=aed,
+                partner=partner,
+            ))
+        self.assertEqual(
+            post.call_args.kwargs['json']['customer']['phone_number'],
+            '971511223344',
+        )
+
+    def test_eligibility_does_not_infer_country_from_currency(self):
+        """Without a billing country, do not invent a calling code from the currency."""
+        aed = self._enable_currency('AED')
+        partner = self.env['res.partner'].create({
+            'name': 'Billing No Country',
+            'email': 'billing@example.com',
+            'phone': '0511223344',
+            'country_id': False,
+        })
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.reason = 'OK'
+        mock_response.url = 'https://api-sandbox.tamara.co/pre-checkout/v1/eligibility'
+        mock_response.text = '{"is_eligible": true}'
+        mock_response.json.return_value = {'is_eligible': True}
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ) as post:
+            self.assertTrue(self.provider._tamara_is_customer_eligible(
+                amount=100,
+                currency=aed,
+                partner=partner,
+            ))
+        self.assertEqual(
+            post.call_args.kwargs['json']['customer']['phone_number'],
+            '0511223344',
+        )
+
     def test_eligibility_hides_without_phone_or_email(self):
         self.assertFalse(self.provider._tamara_is_customer_eligible(
             amount=100, currency=self.currency, phone='', email='buyer@example.com',
@@ -239,6 +454,63 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
                 phone='966501234567',
                 email='buyer@example.com',
             ))
+
+    def test_debug_info_lists_versions(self):
+        info = self.provider.tamara_debug_info
+        self.assertIn('Odoo:', info)
+        self.assertIn('Python:', info)
+        self.assertIn('Tamara Payment:', info)
+        self.assertIn('1.0', info)
+
+    def test_debug_mode_logs_eligibility_request_and_response(self):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.reason = 'OK'
+        mock_response.url = 'https://api-sandbox.tamara.co/pre-checkout/v1/eligibility'
+        mock_response.text = '{"is_eligible": true}'
+        mock_response.json.return_value = {'is_eligible': True}
+        self.provider.tamara_debug_mode = True
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ), self.assertLogs(
+            'odoo.addons.payment_tamara.models.payment_provider', level='INFO',
+        ) as logs:
+            self.assertTrue(self.provider._tamara_is_customer_eligible(
+                amount=100,
+                currency=self.currency,
+                phone='966501234567',
+                email='buyer@example.com',
+            ))
+        messages = '\n'.join(record.getMessage() for record in logs.records)
+        self.assertIn('Tamara - Sending POST API request', messages)
+        self.assertIn('Tamara - Received HTTP 200', messages)
+
+    def test_debug_mode_off_skips_api_traffic_logs(self):
+        mock_response = MagicMock()
+        mock_response.ok = True
+        mock_response.status_code = 200
+        mock_response.reason = 'OK'
+        mock_response.url = 'https://api-sandbox.tamara.co/pre-checkout/v1/eligibility'
+        mock_response.text = '{"is_eligible": true}'
+        mock_response.json.return_value = {'is_eligible': True}
+        self.provider.tamara_debug_mode = False
+        with patch(
+            'odoo.addons.payment_tamara.models.payment_provider.requests.post',
+            return_value=mock_response,
+        ), self.assertLogs(
+            'odoo.addons.payment_tamara.models.payment_provider', level='INFO',
+        ) as logs:
+            self.assertTrue(self.provider._tamara_is_customer_eligible(
+                amount=100,
+                currency=self.currency,
+                phone='966501234567',
+                email='buyer@example.com',
+            ))
+        messages = '\n'.join(record.getMessage() for record in logs.records)
+        self.assertNotIn('Tamara - Sending', messages)
+        self.assertNotIn('Tamara - Received', messages)
 
     def test_webhook_registration_saves_id(self):
         mock_response = MagicMock()
@@ -381,14 +653,14 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         'odoo.addons.payment_tamara.controllers.main',
         'odoo.addons.payment_tamara.models.payment_transaction',
     )
-    def test_webhook_notification_confirms_transaction(self):
+    def test_webhook_notification_authorizes_transaction(self):
         tx = self._create_transaction('redirect', provider_reference=self.order_data['order_id'])
         url = self._build_url(TamaraController._webhook_url)
         token = _sign_tamara_jwt(self.provider._tamara_get_notification_key())
         with patch(
             'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
             return_value=self.order_data,
-        ) as send_request:
+        ) as send_request, patch.object(type(tx), '_post_process'):
             self._make_json_request(
                 f'{url}?tamaraToken={token}',
                 data=self.payment_data,
@@ -401,7 +673,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             json=None,
             reference=tx.reference,
         )
-        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.state, 'authorized')
 
     def _post_webhook_with_order(self, tx, order_data, event_type='order_updated'):
         """POST a Tamara webhook for `tx` and return after fetching `order_data`."""
@@ -554,6 +826,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
             **self.order_data,
             'status': 'fully_captured',
             'captured_amount': {'amount': 111.11, 'currency': 'SAR'},
+            'capture_id': 'cap_webhook_111',
         }
         _, log_message = self._post_webhook_with_order(
             tx, captured_order, event_type='order_captured',
@@ -565,6 +838,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('fully captured', tx.state_message)
         self.assertIn('Captured amount: 111.11 SAR', tx.state_message)
+        self.assertIn('Capture Id: cap_webhook_111', tx.state_message)
         log_message.assert_called_once()
 
     @mute_logger(
@@ -648,11 +922,15 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         response = self._make_json_request(url, data=self.payment_data)
         self.assertEqual(response.status_code, 403)
 
-    def test_apply_updates_sets_authorized_when_manual_capture(self):
-        self.provider.capture_manually = True
+    def test_apply_updates_sets_authorized_for_authorised_status(self):
         tx = self._create_transaction('redirect', provider_reference=self.order_data['order_id'])
         tx._apply_updates(self.order_data)
         self.assertEqual(tx.state, 'authorized')
+
+    def test_apply_updates_sets_done_for_captured_status(self):
+        tx = self._create_transaction('redirect', provider_reference=self.order_data['order_id'])
+        tx._apply_updates({'status': 'fully_captured'})
+        self.assertEqual(tx.state, 'done')
 
     def test_sandbox_credentials_are_used_in_sandbox_mode(self):
         with patch(
@@ -733,6 +1011,7 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         cancel_amount = float(sale_order.amount_total)
         currency_name = sale_order.currency_id.name
         cancel_response = {
+            'cancel_id': 'cancel_so_111',
             'order_id': self.order_data['order_id'],
             'status': 'canceled',
             'canceled_amount': {
@@ -762,8 +1041,9 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertEqual(sale_order.state, 'cancel')
         self.assertEqual(tx.state, 'authorized')
         self.assertTrue(tx.state_message.startswith('Tamara:'))
-        self.assertIn('Payment is Canceled successfully on Tamara side', tx.state_message)
+        self.assertIn('Payment canceled successfully', tx.state_message)
         self.assertIn(f'{cancel_amount:.2f} {currency_name}', tx.state_message)
+        self.assertIn('Cancel Id: cancel_so_111', tx.state_message)
 
     def test_sale_order_cancel_logs_tamara_failure(self):
         sale_order, tx = self._create_sale_order_with_tamara_tx()
@@ -778,6 +1058,67 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertTrue(tx.state_message.startswith('Tamara:'))
         self.assertIn('Cancel action on Tamara side failed', tx.state_message)
         self.assertIn('order already captured', tx.state_message)
+
+    def test_manual_void_logs_cancel_id_on_sale_order(self):
+        """Void Transaction must post Cancel Id and amount on the sale order note."""
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        cancel_amount = float(tx.amount)
+        currency_name = tx.currency_id.name
+        cancel_response = {
+            'cancel_id': 'cancel_void_456',
+            'order_id': self.order_data['order_id'],
+            'status': 'canceled',
+            'canceled_amount': {
+                'amount': cancel_amount,
+                'currency': currency_name,
+            },
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=cancel_response,
+        ):
+            tx.action_void()
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'cancel')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Payment canceled successfully', tx.state_message)
+        self.assertIn(f'Canceled amount: {cancel_amount:.2f} {currency_name}', tx.state_message)
+        self.assertIn('Cancel Id: cancel_void_456', tx.state_message)
+        so_notes = ' '.join(sale_order.message_ids.mapped('body'))
+        self.assertIn('Cancel Id: cancel_void_456', so_notes)
+        self.assertIn(f'{cancel_amount:.2f} {currency_name}', so_notes)
+
+    def test_manual_capture_logs_capture_id_on_sale_order(self):
+        """Capture Transaction must post Capture Id and amount on the sale order note."""
+        sale_order, tx = self._create_sale_order_with_tamara_tx()
+        capture_amount = float(tx.amount)
+        currency_name = tx.currency_id.name
+        capture_response = {
+            'capture_id': 'cap_manual_789',
+            'order_id': self.order_data['order_id'],
+            'status': 'fully_captured',
+            'captured_amount': {
+                'amount': capture_amount,
+                'currency': currency_name,
+            },
+        }
+        with patch(
+            'odoo.addons.payment.models.payment_provider.PaymentProvider._send_api_request',
+            return_value=capture_response,
+        ):
+            tx.action_capture()
+
+        tx.invalidate_recordset()
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.tamara_order_status, 'fully_captured')
+        self.assertTrue(tx.state_message.startswith('Tamara:'))
+        self.assertIn('Order captured successfully', tx.state_message)
+        self.assertIn(f'Capture amount: {capture_amount:.2f} {currency_name}', tx.state_message)
+        self.assertIn('Capture Id: cap_manual_789', tx.state_message)
+        so_notes = ' '.join(sale_order.message_ids.mapped('body'))
+        self.assertIn('Capture Id: cap_manual_789', so_notes)
+        self.assertIn(f'{capture_amount:.2f} {currency_name}', so_notes)
 
     def test_fully_invoice_triggers_tamara_capture(self):
         self.provider.tamara_capture_trigger = 'fully_invoice'
@@ -810,6 +1151,8 @@ class TamaraTest(TamaraCommon, PaymentHttpCommon):
         self.assertIn('Order captured successfully', tx.state_message)
         self.assertIn(f'{capture_amount:.2f} {currency_name}', tx.state_message)
         self.assertIn('cap_invoice_123', tx.state_message)
+        so_notes = ' '.join(sale_order.message_ids.mapped('body'))
+        self.assertIn('Capture Id: cap_invoice_123', so_notes)
 
     def test_fully_invoice_capture_failure_logs_api_response(self):
         self.provider.tamara_capture_trigger = 'fully_invoice'

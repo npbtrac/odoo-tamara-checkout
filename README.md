@@ -67,12 +67,14 @@ If save fails with **Wrong API Token**, check the API token for the selected mod
 1. Open the shop (`/shop`) and add products to the cart.
 2. Go to **Checkout** and fill in the customer details.
    - A valid **phone** and **email** are required; otherwise Tamara is hidden.
+   - Phone is normalized with the **billing address country** calling code (not inferred from currency).
    - Billing country/currency should match Tamara (e.g. Saudi Arabia + SAR, or UAE + AED).
 3. On the payment step, select **Tamara** (instalments). Promo widgets may also appear on the product and cart pages when the provider is published.
 4. Confirm / pay. The customer is redirected to Tamara’s checkout page.
 5. Complete the Tamara payment flow (approve the instalment plan).
 6. After success, Tamara redirects back to Odoo (`/payment/tamara/return`). Odoo re-fetches the order from Tamara and updates the payment (typically **Authorized** after approval/authorisation).
-7. The linked sale order is confirmed according to Odoo’s normal payment post-processing.
+7. The linked sale order is confirmed immediately on the Tamara return/webhook (email/PDF
+   failures must not leave the quotation in draft).
 8. Capture happens later either:
    - automatically (if you configured **Fully invoice** or **Fully Delivered**), or
    - manually via **Capture Transaction** on the authorized payment.
@@ -103,12 +105,14 @@ If checkout creation fails, the customer sees a generic unavailable message; adm
 ### Capture, void & refund
 
 - Manual capture (full amount) via **Capture Transaction** on an authorized payment / sale order → `POST /payments/capture`
+- Successful capture logs `Capture Id` and `Capture amount` on the payment and linked sale order note
 - Automatic full capture when the provider setting **Action to trigger Order Capture** matches:
   - **Fully invoice** — when the sale order becomes fully invoiced
   - **Fully Delivered** — when the sale order becomes fully delivered
   - Success note: `Tamara: Order captured successfully. Capture amount: …. Capture Id: …`
   - Failure note: `Tamara: Capture action on Tamara side failed, error from Tamara: …`
-- Void authorised payments → `POST /orders/{id}/cancel`
+- Void authorised payments (**Void Transaction**) → `POST /orders/{id}/cancel`
+  - Logs `Cancel Id` and `Canceled amount` on the payment and linked sale order note
 - Refunds (including partial) → `POST /payments/simplified-refund/{id}`
 
 ### Sale order cancel
@@ -126,6 +130,7 @@ If checkout creation fails, the customer sees a generic unavailable message; adm
 - Widgets only render when the Tamara provider is **published**
 - Pre-checkout eligibility (`POST /pre-checkout/v1/eligibility`, 2s timeout, fail-open)
 - Hides Tamara when billing phone or email is missing
+- Formats eligibility phone with the billing address country calling code
 
 ### Provider settings
 
@@ -156,6 +161,9 @@ cp -n .env.example .env
 
 # Setup (idempotent — already-done steps are skipped)
 ./scripts/setup-website.sh
+
+# Wipe demo DB + filestore and set up from scratch
+./scripts/setup-website.sh --force-refresh
 
 # Start in the background (default)
 ./scripts/run-website.sh
@@ -211,3 +219,20 @@ The webhook URL is built from the company website domain when set, otherwise fro
 `web.base.url` system parameter. The Tamara sandbox accepts an `http://localhost` URL, so
 registration works locally, but Tamara can only deliver notifications to a URL it can reach:
 use ngrok for an actual end-to-end test.
+
+## Troubleshooting
+
+### Return / webhook and `Unable to find Wkhtmltopdf`
+
+After Tamara authorises a payment, Odoo may try to email a PDF (sale order / payment
+notification). If `wkhtmltopdf` is not installed, that PDF step raises
+`Unable to find Wkhtmltopdf on this system. The PDF can not be created.`
+
+The Tamara return and webhook handlers isolate that failure so:
+
+- the customer still reaches `/payment/status` (no HTTP 422)
+- the webhook still returns HTTP 200
+- the payment stays authorized and the sale order is still confirmed
+
+Install [wkhtmltopdf](https://github.com/wkhtmltopdf/packaging/releases) on the Odoo host if
+you need those confirmation emails/PDFs. Until then, payments and orders still complete.
